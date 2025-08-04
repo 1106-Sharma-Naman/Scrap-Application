@@ -7,6 +7,10 @@ import pandas as pd
 import sqlite3
 import os
 
+# --- Paths ---
+BASE_DIR = os.path.dirname(__file__)        # directory where script is
+IMAGE_DIR = os.path.join(BASE_DIR, "images") # images folder in repo
+
 # --- Database Setup ---
 DB_FILE = "scrap_logs.db"
 
@@ -23,7 +27,7 @@ def init_db():
             shift TEXT NOT NULL,
             reason TEXT,
             comments TEXT,
-            UNIQUE(machine_operator, date) -- Prevent duplicates for same operator/date
+            UNIQUE(machine_operator, date)
         )
     """)
     conn.commit()
@@ -34,10 +38,13 @@ init_db()
 # --- Window Setup ---
 root = tk.Tk()
 root.title("ScrapSense - Add Scrap")
-root.geometry("1920x1080")
-root.configure(bg="#F8FAFC")  # Softer background
+root.configure(bg="#F8FAFC")
 
-# --- Global dictionary for fields ---
+# Maximize window while keeping taskbar
+screen_width = root.winfo_screenwidth()
+screen_height = root.winfo_screenheight()
+root.geometry(f"{screen_width}x{screen_height}")
+
 fields = {}
 
 # --- Function to Update Time ---
@@ -47,7 +54,8 @@ def update_time():
     root.after(1000, update_time)
 
 # --- Function to Load Icons ---
-def load_icon(path, size):
+def load_icon(filename, size):
+    path = os.path.join(IMAGE_DIR, filename)
     try:
         img = Image.open(path).convert("RGBA")
         img = img.resize(size, Image.LANCZOS)
@@ -59,12 +67,10 @@ def load_icon(path, size):
 sidebar = tk.Frame(root, bg="#1E293B", width=80)
 sidebar.pack(side="left", fill="y")
 
-# Logo
 logo_img = load_icon("scraplogo.png", (50, 50))
 if logo_img:
     tk.Label(sidebar, image=logo_img, bg="#1E293B").pack(pady=30)
 
-# Navigation Icons
 nav_icons = [
     ("dashboard.png", "Dashboard"),
     ("add-button.png", "Add Scrap"),
@@ -90,7 +96,6 @@ for icon_path, tooltip in nav_icons:
 main_frame = tk.Frame(root, bg="#F8FAFC")
 main_frame.pack(side="left", fill="both", expand=True)
 
-# Welcome & Time
 username = "Akshay"
 tk.Label(main_frame, text=f"Welcome, {username}", font=("Segoe UI", 24, "bold"),
          bg="#F8FAFC", fg="#1E293B").place(x=100, y=50)
@@ -99,7 +104,6 @@ time_label = tk.Label(main_frame, font=("Segoe UI", 14), bg="#F8FAFC", fg="#4755
 time_label.place(relx=0.98, y=40, anchor="ne")
 update_time()
 
-# Title
 tk.Label(main_frame, text="Add Scrap", font=("Segoe UI", 46, "bold"),
          bg="#F8FAFC", fg="#0F172A").pack(pady=(80, 40))
 
@@ -108,44 +112,64 @@ form_frame = tk.Frame(main_frame, bg="white", padx=40, pady=40,
                       highlightbackground="#E2E8F0", highlightthickness=1)
 form_frame.pack(pady=20)
 
-# Combobox Styling
 style = ttk.Style()
 style.theme_use("clam")
 style.configure("TCombobox", fieldbackground="white", background="white", foreground="black", padding=5)
 
+# --- First Option Selector ---
+tk.Label(form_frame, text="Entry Type:", font=("Segoe UI", 14, "bold"),
+         bg="white", fg="#334155").grid(row=0, column=0, sticky="w", pady=12, padx=10)
+
+entry_type = ttk.Combobox(form_frame, values=["Manual Entry", "SCADA Import"], width=47, font=("Segoe UI", 12))
+entry_type.set("Select Entry Type")
+entry_type.grid(row=0, column=1, pady=12)
+fields["entry_type"] = entry_type
+
+def handle_entry_type_change(event):
+    if entry_type.get() == "SCADA Import":
+        import_scada_report()
+
+entry_type.bind("<<ComboboxSelected>>", handle_entry_type_change)
+
 # --- Field Creator ---
-def create_field(label_text, key, row, is_textbox=False, is_dropdown=False, default=""):
+def create_field(label_text, key, row, is_textbox=False, is_dropdown=False, default="", inline_widget=None):
     tk.Label(form_frame, text=label_text, font=("Segoe UI", 14, "bold"),
              bg="white", fg="#334155", anchor="w").grid(row=row, column=0, sticky="w", pady=12, padx=10)
 
-    if is_textbox:
+    if inline_widget:
+        inline_widget.grid(row=row, column=1, pady=12, sticky="w")
+        return inline_widget
+    elif is_textbox:
         entry = tk.Text(form_frame, width=50, height=5, font=("Segoe UI", 12),
                         fg="black", bg="#F9FAFB", relief="flat",
                         highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
         entry.grid(row=row, column=1, pady=12, ipady=5)
+        fields[key] = entry
+        return entry
     elif is_dropdown:
         entry = ttk.Combobox(form_frame, values=["Morning", "Afternoon", "Night"], width=47, font=("Segoe UI", 12))
         entry.set(default or "Select Shift")
         entry.grid(row=row, column=1, pady=12)
+        fields[key] = entry
+        return entry
     else:
         entry = tk.Entry(form_frame, width=50, font=("Segoe UI", 12),
                          fg="black", bg="#F9FAFB", relief="flat",
                          highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
         entry.insert(0, default)
         entry.grid(row=row, column=1, pady=12, ipady=5)
-
-    fields[key] = entry
-    return entry
+        fields[key] = entry
+        return entry
 
 # --- Fields ---
-create_field("Machine Operator (ID):", "machine_operator", 0)
+create_field("Machine Operator (ID):", "machine_operator", 1)
 
-# Date Picker
+# Date Field
 tk.Label(form_frame, text="Date (MM/DD/YYYY):", font=("Segoe UI", 14, "bold"),
-         bg="white", fg="#334155", anchor="w").grid(row=1, column=0, sticky="w", pady=12, padx=10)
+         bg="white", fg="#334155", anchor="w").grid(row=2, column=0, sticky="w", pady=12, padx=10)
 
 date_frame = tk.Frame(form_frame, bg="white")
-date_frame.grid(row=1, column=1, pady=12, sticky="w")
+date_frame.grid(row=2, column=1, pady=12, sticky="w")
 
 fields["date"] = tk.Entry(date_frame, width=47, font=("Segoe UI", 12),
                           fg="black", bg="#F9FAFB", relief="flat",
@@ -171,13 +195,26 @@ calendar_icon = load_icon("schedule.png", (20, 20))
 if calendar_icon:
     tk.Button(date_frame, image=calendar_icon, command=open_calendar, bg="white", bd=0, cursor="hand2").pack(side="left", padx=5)
 
-# Other fields
-create_field("Quantity:", "quantity", 2)
-create_field("Shift:", "shift", 3, is_dropdown=True)
-create_field("Reason:", "reason", 4)
-create_field("Additional Comments:", "comments", 5, is_textbox=True)
+# Quantity & Unit
+quantity_frame = tk.Frame(form_frame, bg="white")
+quantity_entry = tk.Entry(quantity_frame, width=30, font=("Segoe UI", 12),
+                          fg="black", bg="#F9FAFB", relief="flat",
+                          highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
+quantity_entry.pack(side="left", ipady=5)
 
-# --- SCADA Import ---
+unit_dropdown = ttk.Combobox(quantity_frame, values=["lb", "kg", "units", "grams"], width=5, font=("Segoe UI", 12))
+unit_dropdown.set("Select")
+unit_dropdown.pack(side="left", padx=10)
+
+fields["quantity"] = quantity_entry
+fields["unit"] = unit_dropdown
+
+create_field("Quantity:", None, 3, inline_widget=quantity_frame)
+create_field("Shift:", "shift", 4, is_dropdown=True)
+create_field("Reason:", "reason", 5)
+create_field("Additional Comments:", "comments", 6, is_textbox=True)
+
+# --- SCADA Import Function ---
 def import_scada_report():
     try:
         file_path = filedialog.askopenfilename(
@@ -190,9 +227,8 @@ def import_scada_report():
         )
 
         if not file_path:
-            return  # Cancelled
+            return
 
-        # Load CSV or Excel
         df = pd.read_csv(file_path) if file_path.endswith(".csv") else pd.read_excel(file_path)
 
         if df.empty:
@@ -217,6 +253,8 @@ def import_scada_report():
         fields["quantity"].delete(0, tk.END)
         fields["quantity"].insert(0, get_value("quantity", "scrap quantity"))
 
+        fields["unit"].set(get_value("unit", "measurement unit", default="lb"))
+
         fields["shift"].set(get_value("shift", default="Select Shift"))
 
         fields["reason"].delete(0, tk.END)
@@ -235,12 +273,12 @@ def submit_scrap_entry():
     machine_operator = fields["machine_operator"].get().strip()
     date = fields["date"].get().strip()
     quantity = fields["quantity"].get().strip()
+    unit = fields["unit"].get().strip()
     shift = fields["shift"].get().strip()
     reason = fields["reason"].get().strip()
     comments = fields["comments"].get("1.0", tk.END).strip()
 
-    # Validation
-    if not machine_operator or not date or not quantity or shift == "Select Shift":
+    if not machine_operator or not date or not quantity or shift == "Select Shift" or not unit:
         messagebox.showerror("Validation Error", "Please fill in all required fields.")
         return
 
@@ -250,14 +288,13 @@ def submit_scrap_entry():
         messagebox.showerror("Validation Error", "Quantity must be a number.")
         return
 
-    # Save to DB
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO scrap_logs (machine_operator, date, quantity, shift, reason, comments)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (machine_operator, date, quantity, shift, reason, comments))
+            INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (machine_operator, date, quantity, unit, shift, reason, comments))
         conn.commit()
         conn.close()
         messagebox.showinfo("Success", "Scrap entry saved successfully!")
@@ -267,13 +304,9 @@ def submit_scrap_entry():
         messagebox.showerror("Database Error", f"An error occurred: {e}")
 
 # --- Buttons ---
-style.configure("Blue.TButton", background="#3B82F6", foreground="white", font=("Segoe UI", 14, "bold"), padding=10)
-style.map("Blue.TButton", background=[("active", "#2563EB")])
-
 style.configure("Green.TButton", background="#22C55E", foreground="white", font=("Segoe UI", 16, "bold"), padding=10)
 style.map("Green.TButton", background=[("active", "#16A34A")])
 
-ttk.Button(main_frame, text="Import SCADA Report", style="Blue.TButton", cursor="hand2", command=import_scada_report).pack(pady=(10, 5), ipady=5)
 ttk.Button(main_frame, text="Submit Scrap Entry", style="Green.TButton", cursor="hand2", command=submit_scrap_entry).pack(pady=30, ipady=5)
 
 root.mainloop()
