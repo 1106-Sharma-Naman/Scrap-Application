@@ -1,6 +1,20 @@
 import tkinter as tk
 from PIL import Image, ImageTk
 from datetime import datetime
+import os
+
+# --- Base Paths ---
+BASE_DIR = os.path.dirname(__file__)        # directory where script is
+IMAGE_DIR = os.path.join(BASE_DIR, "images") # images folder in repo
+
+# --- Function to Load Icons ---
+def load_icon(filename, size):
+    path = os.path.join(IMAGE_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Image not found: {path}")
+    img = Image.open(path).convert("RGBA")
+    img = img.resize(size, Image.LANCZOS)
+    return ImageTk.PhotoImage(img)
 
 # --- Window Setup ---
 root = tk.Tk()
@@ -15,21 +29,13 @@ def update_time():
     time_label.config(text=current_time)
     root.after(1000, update_time)
 
-# --- Function to Load Icons ---
-def load_icon(path, size):
-    img = Image.open(path).convert("RGBA")
-    img = img.resize(size, Image.LANCZOS)
-    return ImageTk.PhotoImage(img)
-
 # --- Sidebar Frame (Slim) ---
 sidebar_width = 80
 sidebar = tk.Frame(root, bg="#1F3B4D", width=sidebar_width, height=1080)
 sidebar.pack(side="left", fill="y")
 
 # --- Sidebar Logo ---
-logo_img = Image.open("scraplogo.png")
-logo_img = logo_img.resize((50, 50), Image.LANCZOS)
-logo_tk = ImageTk.PhotoImage(logo_img)
+logo_tk = load_icon("scraplogo.png", (50, 50))
 logo_label = tk.Label(sidebar, image=logo_tk, bg="#1F3B4D")
 logo_label.pack(pady=30)
 
