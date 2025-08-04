@@ -21,8 +21,10 @@ root = tk.Tk()
 root.title("ScrapSense Dashboard")
 root.configure(bg="#E6EBEF")
 
-# Make window fullscreen automatically (works cross-platform)
-root.attributes('-fullscreen', True)
+# Make window size match user's screen resolution (keep X button)
+screen_width = root.winfo_screenwidth()
+screen_height = root.winfo_screenheight()
+root.geometry(f"{screen_width}x{screen_height}")
 
 # --- Function to Update Time ---
 def update_time():
