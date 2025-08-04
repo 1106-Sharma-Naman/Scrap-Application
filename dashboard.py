@@ -19,8 +19,10 @@ def load_icon(filename, size):
 # --- Window Setup ---
 root = tk.Tk()
 root.title("ScrapSense Dashboard")
-root.geometry("1920x1080")
 root.configure(bg="#E6EBEF")
+
+# Make window fullscreen automatically (works cross-platform)
+root.attributes('-fullscreen', True)
 
 # --- Function to Update Time ---
 def update_time():
@@ -31,7 +33,7 @@ def update_time():
 
 # --- Sidebar Frame (Slim) ---
 sidebar_width = 80
-sidebar = tk.Frame(root, bg="#1F3B4D", width=sidebar_width, height=1080)
+sidebar = tk.Frame(root, bg="#1F3B4D", width=sidebar_width)
 sidebar.pack(side="left", fill="y")
 
 # --- Sidebar Logo ---
