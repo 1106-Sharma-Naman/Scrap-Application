@@ -19,7 +19,7 @@ def load_icon(filename, size):
 # --- Window Setup ---
 root = tk.Tk()
 root.title("ScrapSense Dashboard")
-root.geometry("1920x1080")
+root.geometry("fullxfull")
 root.configure(bg="#E6EBEF")
 
 # --- Function to Update Time ---
