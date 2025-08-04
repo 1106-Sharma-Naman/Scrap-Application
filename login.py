@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
 def login():
@@ -15,121 +15,89 @@ def login():
 def forgot_password():
     messagebox.showinfo("Forgot Password", "Password reset link sent to your email (not really).")
 
-# Initialize main window
+# Initialize root window
 root = tk.Tk()
 root.title("Login Page")
 root.configure(bg="white")
 
-# Get screen width and height
+# Get screen size and set dynamic window size
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
-
-# Set window size to 60% of screen dimensions
-window_width = int(screen_width * 0.6)
+window_width = int(screen_width * 0.5)
 window_height = int(screen_height * 0.6)
-
-# Center window on screen
 x = (screen_width - window_width) // 2
 y = (screen_height - window_height) // 2
 root.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
-# Adjust scaling for high DPI
+# Apply scaling for high DPI screens
 try:
     root.tk.call('tk', 'scaling', screen_width / 1920)
 except:
     pass
 
-# Fonts scaled according to screen size
-base_font_size = int(window_width * 0.015)
-entry_font_size = int(base_font_size * 0.9)
-button_font_size = int(base_font_size * 0.9)
+# ------------------- ttk style -------------------
+style = ttk.Style()
+style.theme_use("clam")
 
-# Main frame
-container = tk.Frame(
-    root,
-    bg="#f9f9f9",
-    bd=1,
+# Configure styles
+style.configure("TEntry",
+    padding=6,
     relief="solid",
-    highlightbackground="gray",
-    highlightthickness=0
+    borderwidth=1,
+    font=("Helvetica", 12)
 )
-container.place(relx=0.5, rely=0.5, anchor="center", width=window_width * 0.5, height=window_height * 0.85)
 
-# Load logo or fallback
+style.configure("TButton",
+    font=("Helvetica", 12, "bold"),
+    foreground="white",
+    background="#3E84FB",
+    padding=6
+)
+
+style.map("TButton",
+    background=[("active", "#3498DB")]
+)
+
+# ------------------- Main UI -------------------
+container = tk.Frame(root, bg="white")
+container.place(relx=0.5, rely=0.5, anchor="center", width=window_width * 0.6, height=window_height * 0.9)
+
+# Logo (fallback if missing)
 try:
-    image = Image.open("logo.png")
-    image = image.resize((100, 100))
-    logo = ImageTk.PhotoImage(image)
-    logo_label = tk.Label(container, image=logo, bg="#f9f9f9")
-    logo_label.image = logo
-    logo_label.pack(pady=(20, 10))
+    img = Image.open("logo.png")
+    img = img.resize((100, 100))
+    logo_img = ImageTk.PhotoImage(img)
+    logo_label = tk.Label(container, image=logo_img, bg="white")
+    logo_label.image = logo_img
+    logo_label.pack(pady=(10, 5))
 except:
-    logo_label = tk.Label(container, text="Your Logo", font=("Arial", base_font_size), bg="#f9f9f9")
-    logo_label.pack(pady=(20, 10))
+    logo_label = tk.Label(container, text="Your Logo", font=("Arial", 16), bg="white")
+    logo_label.pack(pady=(10, 5))
 
-label_font = ("Helvetica", base_font_size)
-entry_font = ("Helvetica", entry_font_size)
+# Input fields
+def create_labeled_entry(label_text):
+    tk.Label(container, text=label_text, font=("Helvetica", 13), bg="white").pack(anchor="w", padx=40, pady=(10, 0))
+    entry = ttk.Entry(container, width=30, style="TEntry")
+    entry.pack(pady=5, ipady=4)
+    return entry
 
-entry_config = {
-    "font": entry_font,
-    "width": 30,
-    "relief": "solid",
-    "bd": 1,
-    "bg": "white",
-    "fg": "black",
-    "insertbackground": "black",
-    "highlightthickness": 1,
-    "highlightbackground": "#ccc",
-    "highlightcolor": "#3E84FB"
-}
+username_entry = create_labeled_entry("Username")
+company_id_entry = create_labeled_entry("Company ID")
+password_entry = create_labeled_entry("Password")
+password_entry.config(show="*")
 
-# Username
-tk.Label(container, text="Username", font=label_font, bg="#f9f9f9", fg="black").pack(pady=(10, 0))
-username_entry = tk.Entry(container, **entry_config)
-username_entry.pack(ipady=6, pady=5)
+# Login button
+login_button = ttk.Button(container, text="Login", command=login, style="TButton")
+login_button.pack(pady=(20, 10), ipadx=10)
 
-# Company ID
-tk.Label(container, text="Company ID", font=label_font, bg="#f9f9f9", fg="black").pack(pady=(10, 0))
-company_id_entry = tk.Entry(container, **entry_config)
-company_id_entry.pack(ipady=6, pady=5)
-
-# Password
-tk.Label(container, text="Password", font=label_font, bg="#f9f9f9", fg="black").pack(pady=(10, 0))
-password_entry = tk.Entry(container, **entry_config, show="*")
-password_entry.pack(ipady=6, pady=5)
-
-# Login Button
-def on_login_hover(e):
-    login_btn.config(bg="#3498DB")
-
-def on_login_leave(e):
-    login_btn.config(bg="#3E84FB")
-
-login_btn = tk.Button(
-    container,
-    text="Login",
-    font=("Helvetica", button_font_size, "bold"),
-    bg="#3E84FB",
-    fg="white",
-    activebackground="#3498DB",
-    activeforeground="white",
-    width=20,
-    relief="flat",
-    bd=0,
-    command=login
-)
-login_btn.pack(pady=20, ipadx=5, ipady=6)
-login_btn.bind("<Enter>", on_login_hover)
-login_btn.bind("<Leave>", on_login_leave)
-
-# Forgot Password
+# Forgot password link
 forgot_label = tk.Label(
     container,
     text="Forgot Password?",
-    font=("Helvetica", int(button_font_size * 0.8), "underline"),
+    font=("Helvetica", 11, "underline"),
     fg="blue",
-    cursor="hand2",
-    bg="#f9f9f9"
+    bg="white",
+    cursor="hand2"
 )
 forgot_label.pack()
 forgot_label.bind("<Button-1>", lambda e: forgot_password())
