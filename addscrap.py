@@ -132,15 +132,15 @@ tk.Label(form_frame, text="Entry Type:", font=("Segoe UI", int(14 * scale_font),
          bg="white", fg="#334155").grid(row=0, column=0, sticky="w",
                                         pady=int(12 * scale_y), padx=int(10 * scale_x))
 
-entry_type = ttk.Combobox(form_frame, values=["Manual Entry", "SCADA Import"],
+entry_type = ttk.Combobox(form_frame, values=["Manual Entry", "Import Document"],
                           width=int(47 * scale_x), font=("Segoe UI", int(12 * scale_font)))
 entry_type.set("Select Entry Type")
 entry_type.grid(row=0, column=1, pady=int(12 * scale_y))
 fields["entry_type"] = entry_type
 
 def handle_entry_type_change(event):
-    if entry_type.get() == "SCADA Import":
-        import_scada_report()
+    if entry_type.get() == "Import Document":
+        import_document()
 
 entry_type.bind("<<ComboboxSelected>>", handle_entry_type_change)
 
@@ -235,11 +235,11 @@ create_field("Shift:", "shift", 4, is_dropdown=True)
 create_field("Reason:", "reason", 5)
 create_field("Additional Comments:", "comments", 6, is_textbox=True)
 
-# --- SCADA Import Function ---
-def import_scada_report():
+# --- Import Document Function ---
+def import_document():
     try:
         file_path = filedialog.askopenfilename(
-            title="Select SCADA Report",
+            title="Select Document",
             filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
         )
         if not file_path:
@@ -272,7 +272,7 @@ def import_scada_report():
         fields["comments"].delete("1.0", tk.END)
         fields["comments"].insert("1.0", get_value("comments", "notes"))
 
-        messagebox.showinfo("Success", "SCADA report imported successfully!")
+        messagebox.showinfo("Success", "Document imported successfully!")
     except Exception as e:
         messagebox.showerror("Error", f"Failed to import file:\n{e}")
 
