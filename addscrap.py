@@ -4,22 +4,29 @@ from tkcalendar import Calendar
 from PIL import Image, ImageTk
 from datetime import datetime
 import pandas as pd
-import sqlite3
+import psycopg2
 import os
 
 # --- Paths ---
-BASE_DIR = os.path.dirname(__file__)        # directory where script is
-IMAGE_DIR = os.path.join(BASE_DIR, "images") # images folder in repo
+BASE_DIR = os.path.dirname(__file__)
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
 
-# --- Database Setup ---
-DB_FILE = "scrap_logs.db"
+# --- Database ---
+def get_db_connection():
+    return psycopg2.connect(
+        dbname="scrapsense",
+        user="postgres",
+        password="",
+        host="localhost",
+        port="5432"
+    )
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS scrap_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             machine_operator TEXT NOT NULL,
             date TEXT NOT NULL,
             quantity REAL NOT NULL,
@@ -31,34 +38,53 @@ def init_db():
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
 
-# --- Window Setup ---
+# --- Duplicate check function ---
+def entry_exists(machine_operator, date):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 1 FROM scrap_logs WHERE machine_operator = %s AND date = %s
+    """, (machine_operator, date))
+    exists = cursor.fetchone() is not None
+    cursor.close()
+    conn.close()
+    return exists
+
+# --- Flexible value getter for file imports ---
+def get_value(row, *possible_names, default=""):
+    for name in possible_names:
+        lname = name.lower().replace(" ", "").replace("_", "")
+        for col in row.keys():
+            c = col.lower().replace(" ", "").replace("_", "")
+            if lname == c and pd.notna(row[col]):
+                return str(row[col])
+    return default
+
+# --- GUI Setup ---
 root = tk.Tk()
 root.title("ScrapSense - Add Scrap")
 root.configure(bg="#F8FAFC")
 
-# Get screen dimensions
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 root.geometry(f"{screen_width}x{screen_height}")
 
-# Scaling factors (base: 1920x1080)
 scale_x = screen_width / 1920
 scale_y = screen_height / 1080
 scale_font = (scale_x + scale_y) / 2
 
 fields = {}
 
-# --- Function to Update Time ---
 def update_time():
     now = datetime.now()
     time_label.config(text=now.strftime("%A, %B %d, %Y  %I:%M:%S %p"))
     root.after(1000, update_time)
 
-# --- Function to Load Icons ---
 def load_icon(filename, size):
     path = os.path.join(IMAGE_DIR, filename)
     try:
@@ -68,7 +94,25 @@ def load_icon(filename, size):
     except FileNotFoundError:
         return None
 
-# --- Sidebar ---
+def create_tooltip(widget, text):
+    tooltip = tk.Toplevel(widget)
+    tooltip.withdraw()
+    tooltip.overrideredirect(True)
+    label = tk.Label(tooltip, text=text, bg="black", fg="white", padx=5, pady=3, relief="solid", borderwidth=1)
+    label.pack()
+
+    def show_tooltip(event):
+        x = event.widget.winfo_rootx() + event.widget.winfo_width() + 10
+        y = event.widget.winfo_rooty() + event.widget.winfo_height() // 2
+        tooltip.geometry(f"+{x}+{y}")
+        tooltip.deiconify()
+
+    def hide_tooltip(event):
+        tooltip.withdraw()
+
+    widget.bind("<Enter>", show_tooltip)
+    widget.bind("<Leave>", hide_tooltip)
+
 sidebar_width = int(80 * scale_x)
 sidebar = tk.Frame(root, bg="#1E293B", width=sidebar_width)
 sidebar.pack(side="left", fill="y")
@@ -86,20 +130,21 @@ nav_icons = [
     ("setting.png", "Settings")
 ]
 
-def on_hover(e, color):
-    e.widget.config(bg=color)
+def on_enter_sidebar(e):
+    e.widget.config(bg="#334155")
+
+def on_leave_sidebar(e):
+    e.widget.config(bg="#1E293B")
 
 for icon_path, tooltip in nav_icons:
     icon_img = load_icon(icon_path, (int(30 * scale_x), int(30 * scale_y)))
-    if icon_img:
-        btn = tk.Label(sidebar, image=icon_img, bg="#1E293B",
-                       width=sidebar_width, height=int(60 * scale_y))
-        btn.image = icon_img
-        btn.pack(pady=int(8 * scale_y))
-        btn.bind("<Enter>", lambda e, c="#334155": on_hover(e, c))
-        btn.bind("<Leave>", lambda e, c="#1E293B": on_hover(e, c))
+    btn = tk.Label(sidebar, image=icon_img, bg="#1E293B", width=sidebar_width, height=int(60 * scale_y))
+    btn.image = icon_img
+    btn.pack(pady=int(5 * scale_y))
+    btn.bind("<Enter>", on_enter_sidebar)
+    btn.bind("<Leave>", on_leave_sidebar)
+    create_tooltip(btn, tooltip)
 
-# --- Main Frame ---
 main_frame = tk.Frame(root, bg="#F8FAFC")
 main_frame.pack(side="left", fill="both", expand=True)
 
@@ -117,7 +162,6 @@ tk.Label(main_frame, text="Add Scrap",
          font=("Segoe UI", int(46 * scale_font), "bold"),
          bg="#F8FAFC", fg="#0F172A").pack(pady=(int(80 * scale_y), int(40 * scale_y)))
 
-# --- Form Frame ---
 form_frame = tk.Frame(main_frame, bg="white",
                       padx=int(40 * scale_x), pady=int(40 * scale_y),
                       highlightbackground="#E2E8F0", highlightthickness=1)
@@ -127,7 +171,6 @@ style = ttk.Style()
 style.theme_use("clam")
 style.configure("TCombobox", fieldbackground="white", background="white", foreground="black", padding=int(5 * scale_y))
 
-# --- First Option Selector ---
 tk.Label(form_frame, text="Entry Type:", font=("Segoe UI", int(14 * scale_font), "bold"),
          bg="white", fg="#334155").grid(row=0, column=0, sticky="w",
                                         pady=int(12 * scale_y), padx=int(10 * scale_x))
@@ -144,7 +187,6 @@ def handle_entry_type_change(event):
 
 entry_type.bind("<<ComboboxSelected>>", handle_entry_type_change)
 
-# --- Field Creator ---
 def create_field(label_text, key, row, is_textbox=False, is_dropdown=False, default="", inline_widget=None):
     tk.Label(form_frame, text=label_text, font=("Segoe UI", int(14 * scale_font), "bold"),
              bg="white", fg="#334155", anchor="w").grid(row=row, column=0, sticky="w",
@@ -177,7 +219,6 @@ def create_field(label_text, key, row, is_textbox=False, is_dropdown=False, defa
         fields[key] = entry
         return entry
 
-# --- Fields ---
 create_field("Machine Operator (ID):", "machine_operator", 1)
 
 # Date Field
@@ -235,7 +276,7 @@ create_field("Shift:", "shift", 4, is_dropdown=True)
 create_field("Reason:", "reason", 5)
 create_field("Additional Comments:", "comments", 6, is_textbox=True)
 
-# --- Import Document Function ---
+# --- Enhanced import_document() ---
 def import_document():
     try:
         file_path = filedialog.askopenfilename(
@@ -250,33 +291,73 @@ def import_document():
             messagebox.showwarning("Empty File", "The selected file has no data.")
             return
 
-        df.columns = df.columns.str.strip().str.lower()
-        row = df.iloc[0].to_dict()
+        df.columns = df.columns.str.strip()  # Clean column names
 
-        def get_value(*possible_names, default=""):
-            for name in possible_names:
-                if name.lower() in row and pd.notna(row[name.lower()]):
-                    return str(row[name.lower()])
-            return default
+        inserted, skipped = 0, 0
+        last_good = {}
+        for _, row in df.iterrows():
+            mop = get_value(row, "machine operator id", "operator id", "operator")
+            date = get_value(row, "date", default=datetime.now().strftime("%m/%d/%Y"))
+            qty = get_value(row, "quantity", "scrap quantity")
+            unit = get_value(row, "unit", "measurement unit", default="lb")
+            shift = get_value(row, "shift", default="Select Shift")
+            reason = get_value(row, "reason", "scrap reason")
+            comments = get_value(row, "comments", "notes")
 
-        fields["machine_operator"].delete(0, tk.END)
-        fields["machine_operator"].insert(0, get_value("machine operator id", "operator id", "operator"))
-        fields["date"].delete(0, tk.END)
-        fields["date"].insert(0, get_value("date", default=datetime.now().strftime("%m/%d/%Y")))
-        fields["quantity"].delete(0, tk.END)
-        fields["quantity"].insert(0, get_value("quantity", "scrap quantity"))
-        fields["unit"].set(get_value("unit", "measurement unit", default="lb"))
-        fields["shift"].set(get_value("shift", default="Select Shift"))
-        fields["reason"].delete(0, tk.END)
-        fields["reason"].insert(0, get_value("reason", "scrap reason"))
-        fields["comments"].delete("1.0", tk.END)
-        fields["comments"].insert("1.0", get_value("comments", "notes"))
+            # Skip empty/incomplete
+            if not mop or not date or not qty or shift == "Select Shift" or not unit:
+                continue
 
-        messagebox.showinfo("Success", "Document imported successfully!")
+            if entry_exists(mop, date):
+                skipped += 1
+                continue
+
+            try:
+                qty = float(qty)
+            except ValueError:
+                continue
+
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (mop, date, qty, unit, shift, reason, comments))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                inserted += 1
+                last_good = dict(machine_operator=mop, date=date, quantity=qty, unit=unit, shift=shift, reason=reason, comments=comments)
+            except psycopg2.errors.UniqueViolation:
+                skipped += 1
+            except Exception:
+                skipped += 1
+
+        # Feedback to user
+        message = f"Imported {inserted} records."
+        if skipped:
+            message += f" Skipped {skipped} duplicate or invalid rows."
+        messagebox.showinfo("Import Result", message)
+
+        # Fill UI fields with last imported row
+        if inserted > 0 and last_good:
+            fields["machine_operator"].delete(0, tk.END)
+            fields["machine_operator"].insert(0, last_good["machine_operator"])
+            fields["date"].delete(0, tk.END)
+            fields["date"].insert(0, last_good["date"])
+            fields["quantity"].delete(0, tk.END)
+            fields["quantity"].insert(0, last_good["quantity"])
+            fields["unit"].set(last_good["unit"])
+            fields["shift"].set(last_good["shift"])
+            fields["reason"].delete(0, tk.END)
+            fields["reason"].insert(0, last_good["reason"])
+            fields["comments"].delete("1.0", tk.END)
+            fields["comments"].insert("1.0", last_good["comments"])
     except Exception as e:
         messagebox.showerror("Error", f"Failed to import file:\n{e}")
 
-# --- Submit Scrap Entry ---
+# --- Enhanced submit_scrap_entry() ---
 def submit_scrap_entry():
     machine_operator = fields["machine_operator"].get().strip()
     date = fields["date"].get().strip()
@@ -296,22 +377,26 @@ def submit_scrap_entry():
         messagebox.showerror("Validation Error", "Quantity must be a number.")
         return
 
+    if entry_exists(machine_operator, date):
+        messagebox.showerror("Duplicate Entry", "An entry for this operator and date already exists.")
+        return
+
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (machine_operator, date, quantity, unit, shift, reason, comments))
         conn.commit()
+        cursor.close()
         conn.close()
         messagebox.showinfo("Success", "Scrap entry saved successfully!")
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
         messagebox.showerror("Duplicate Entry", "An entry for this operator and date already exists.")
     except Exception as e:
         messagebox.showerror("Database Error", f"An error occurred: {e}")
 
-# --- Buttons ---
 style.configure("Green.TButton",
                 background="#22C55E", foreground="white",
                 font=("Segoe UI", int(16 * scale_font), "bold"),
