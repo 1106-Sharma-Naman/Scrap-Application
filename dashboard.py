@@ -3,11 +3,9 @@ from PIL import Image, ImageTk
 from datetime import datetime
 import os
 
-# --- Base Paths ---
-BASE_DIR = os.path.dirname(__file__)        # directory where script is
-IMAGE_DIR = os.path.join(BASE_DIR, "images") # images folder in repo
+BASE_DIR = os.path.dirname(__file__)
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
 
-# --- Function to Load Icons ---
 def load_icon(filename, size):
     path = os.path.join(IMAGE_DIR, filename)
     if not os.path.exists(path):
@@ -16,169 +14,128 @@ def load_icon(filename, size):
     img = img.resize(size, Image.LANCZOS)
     return ImageTk.PhotoImage(img)
 
-# --- Window Setup ---
-root = tk.Tk()
-root.title("ScrapSense Dashboard")
-root.configure(bg="#E6EBEF")
 
-# Detect screen size and scaling factor
-screen_width = root.winfo_screenwidth()
-screen_height = root.winfo_screenheight()
-root.geometry(f"{screen_width}x{screen_height}")
+class DashboardFrame(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent, bg="#E6EBEF")
+        self.controller = controller
 
-# Scale factors relative to base 1920x1080 design
-scale_x = screen_width / 1920
-scale_y = screen_height / 1080
-scale_font = (scale_x + scale_y) / 2
+        self.scale_x = self.winfo_screenwidth() / 1920
+        self.scale_y = self.winfo_screenheight() / 1080
+        self.scale_font = (self.scale_x + self.scale_y) / 2
 
-# --- Function to Update Time ---
-def update_time():
-    now = datetime.now()
-    current_time = now.strftime("%A, %B %d, %Y  %I:%M:%S %p")
-    time_label.config(text=current_time)
-    root.after(1000, update_time)
+        self.build_interface()
 
-# --- Sidebar Frame (Slim) ---
-sidebar_width = int(80 * scale_x)
-sidebar = tk.Frame(root, bg="#1F3B4D", width=sidebar_width)
-sidebar.pack(side="left", fill="y")
+    def build_interface(self):
+        username = "Akshay"
+        # Welcome text
+        tk.Label(self,
+                 text=f"Welcome, {username}",
+                 font=("Segoe UI", int(24 * self.scale_font), "bold"),
+                 bg="#E6EBEF", fg="#1F3B4D").place(
+            x=int(100 * self.scale_x), y=int(50 * self.scale_y))
 
-# --- Sidebar Logo ---
-logo_tk = load_icon("scraplogo.png", (int(50 * scale_x), int(50 * scale_y)))
-logo_label = tk.Label(sidebar, image=logo_tk, bg="#1F3B4D")
-logo_label.pack(pady=int(30 * scale_y))
+        # Clock
+        self.time_label = tk.Label(self,
+                                   font=("Segoe UI", int(14 * self.scale_font)),
+                                   bg="#E6EBEF", fg="#1F3B4D")
+        self.time_label.place(relx=0.98, y=int(40 * self.scale_y), anchor="ne")
+        self.update_time()
 
-# --- Sidebar Navigation (Icons Only) ---
-nav_icons = [
-    ("dashboard.png", "Dashboard"),
-    ("add-button.png", "Add Scrap"),
-    ("prediction.png", "Predictions"),
-    ("doc.png", "Scrap Logs"),
-    ("report-card.png", "Reports"),
-    ("setting.png", "Settings")
-]
+        # Dashboard heading
+        tk.Label(self, text="Dashboard",
+                 font=("Segoe UI", int(48 * self.scale_font), "bold"),
+                 bg="#E6EBEF", fg="#1F3B4D").pack(
+            pady=(int(80 * self.scale_y), int(30 * self.scale_y)))
 
-def on_enter_sidebar(e):
-    e.widget.config(bg="#2D4F64")
+        # KPI container
+        kpi_frame = tk.Frame(self, bg="#E6EBEF")
+        kpi_frame.pack(pady=(0, int(40 * self.scale_y)))
 
-def on_leave_sidebar(e):
-    e.widget.config(bg="#1F3B4D")
+        self.create_kpi_card(kpi_frame, "reduce-cost.png", "Today's Scrap", "120 lbs", "#F6A96D", 0)
+        self.create_kpi_card(kpi_frame, "dollar-sign.png", "This Week's Scrap Cost", "$4,200", "#86EFAC", 1)
+        self.create_kpi_card(kpi_frame, "warning-triangle.png", "Top Cause", "Machine Misalign", "#FF7F7F", 2)
+        self.create_kpi_card(kpi_frame, "predictive-chart.png", "Predicted End-of-Month", "3,200 lbs", "#7DD3FC", 3)
 
-for icon_path, tooltip in nav_icons:
-    icon_img = load_icon(icon_path, (int(30 * scale_x), int(30 * scale_y)))
-    btn = tk.Label(sidebar, image=icon_img, bg="#1F3B4D", width=sidebar_width, height=int(60 * scale_y))
-    btn.image = icon_img
-    btn.pack(pady=int(5 * scale_y))
-    btn.bind("<Enter>", on_enter_sidebar)
-    btn.bind("<Leave>", on_leave_sidebar)
+        # Button cards
+        button_frame = tk.Frame(self, bg="#E6EBEF")
+        button_frame.pack()
 
-# --- Main Content Frame ---
-main_frame = tk.Frame(root, bg="#E6EBEF")
-main_frame.pack(side="left", fill="both", expand=True)
+        self.create_button_card(button_frame, "Add Scrap", "add-button.png", 0, 0)
+        self.create_button_card(button_frame, "View Predictions", "prediction.png", 0, 1)
+        self.create_button_card(button_frame, "View Scrap Logs", "doc.png", 1, 0)
+        self.create_button_card(button_frame, "Generate Report", "report-card.png", 1, 1)
 
-# --- Welcome Message ---
-username = "Akshay"
-welcome_label = tk.Label(main_frame, text=f"Welcome, {username}", font=("Segoe UI", int(24 * scale_font), "bold"), bg="#E6EBEF", fg="#1F3B4D")
-welcome_label.place(x=int(100 * scale_x), y=int(50 * scale_y))
+    def update_time(self):
+        now = datetime.now()
+        self.time_label.config(text=now.strftime("%A, %B %d, %Y  %I:%M:%S %p"))
+        self.after(1000, self.update_time)
 
-# --- Update Time ---
-time_label = tk.Label(main_frame, font=("Segoe UI", int(14 * scale_font)), bg="#E6EBEF", fg="#1F3B4D")
-time_label.place(relx=0.98, y=int(40 * scale_y), anchor="ne")
-update_time()
+    def create_kpi_card(self, parent, icon_file, title, value, color, column):
+        """Create a single KPI Card with balanced vertical spacing."""
+        icon = load_icon(icon_file, (int(50 * self.scale_x), int(50 * self.scale_y)))
 
-# --- Title ---
-title_label = tk.Label(main_frame, text="Dashboard", font=("Segoe UI", int(48 * scale_font), "bold"), bg="#E6EBEF", fg="#1F3B4D")
-title_label.pack(pady=(int(80 * scale_y), int(30 * scale_y)))
+        card = tk.Frame(parent,
+                        bg=color,
+                        width=int(320 * self.scale_x),
+                        height=int(175 * self.scale_y),
+                        highlightthickness=1,
+                        highlightbackground="#CCCCCC")
+        card.grid(row=0, column=column, padx=int(30 * self.scale_x))
+        card.pack_propagate(False)  # keep fixed size
 
-# --- KPI Stats Frame ---
-kpi_frame = tk.Frame(main_frame, bg="#E6EBEF")
-kpi_frame.pack(pady=(0, int(40 * scale_y)))
+        # Icon
+        tk.Label(card, image=icon, bg=color).pack(pady=(int(10 * self.scale_y), int(5 * self.scale_y)))
 
-# --- Load KPI Icons ---
-today_icon = load_icon("reduce-cost.png", (int(50 * scale_x), int(50 * scale_y)))
-week_cost_icon = load_icon("dollar-sign.png", (int(50 * scale_x), int(50 * scale_y)))
-cause_icon = load_icon("warning-triangle.png", (int(50 * scale_x), int(50 * scale_y)))
-predicted_icon = load_icon("predictive-chart.png", (int(50 * scale_x), int(50 * scale_y)))
+        # Title
+        tk.Label(card,
+                 text=title,
+                 font=("Segoe UI", int(18 * self.scale_font), "bold"),
+                 bg=color,
+                 fg="white",
+                 anchor="center",
+                 justify="center").pack(pady=(0, 5), fill='x')
 
-def create_kpi_card(parent, icon, title, value, color):
-    card = tk.Frame(parent, bg=color, width=int(320 * scale_x), height=int(175 * scale_y), highlightthickness=1, highlightbackground="#CCCCCC")
-    card.pack_propagate(False)
+        # Value
+        tk.Label(card,
+                 text=value,
+                 font=("Segoe UI", int(22 * self.scale_font), "bold"),
+                 bg=color,
+                 fg="white",
+                 anchor="center",
+                 justify="center").pack(fill='both', expand=True, pady=(0, 15))
 
-    icon_label = tk.Label(card, image=icon, bg=color)
-    icon_label.pack(pady=(int(20 * scale_y), 0))
+        card.image = icon  # Keep reference
 
-    title_label = tk.Label(card, text=title, font=("Segoe UI", int(14 * scale_font), "bold"), bg=color, fg="white")
-    title_label.pack()
+    def create_button_card(self, parent, text, icon_file, row, column):
+        """Create a big clickable button card."""
+        icon = load_icon(icon_file, (int(30 * self.scale_x), int(30 * self.scale_y)))
 
-    value_label = tk.Label(card, text=value, font=("Segoe UI", int(20 * scale_font), "bold"), bg=color, fg="white")
-    value_label.pack()
+        btn_card = tk.Frame(parent,
+                            bg="white",
+                            width=int(350 * self.scale_x),
+                            height=int(150 * self.scale_y),
+                            highlightthickness=1,
+                            highlightbackground="#D0D7DE")
+        btn_card.grid(row=row, column=column,
+                      padx=int(40 * self.scale_x),
+                      pady=int(20 * self.scale_y))
+        btn_card.pack_propagate(False)
 
-    return card
-
-today_scrap = create_kpi_card(kpi_frame, today_icon, "Today's Scrap", "120 lbs", "#F6A96D")
-week_cost = create_kpi_card(kpi_frame, week_cost_icon, "This Week's Scrap Cost", "$4,200", "light green")
-top_cause = create_kpi_card(kpi_frame, cause_icon, "Top Cause", "Machine Misalign", "#FF7F7F")
-predicted_scrap = create_kpi_card(kpi_frame, predicted_icon, "Predicted End-of-Month", "3,200 lbs", "light blue")
-
-today_scrap.grid(row=0, column=0, padx=int(30 * scale_x))
-week_cost.grid(row=0, column=1, padx=int(30 * scale_x))
-top_cause.grid(row=0, column=2, padx=int(30 * scale_x))
-predicted_scrap.grid(row=0, column=3, padx=int(30 * scale_x))
-
-# --- Load Button Images ---
-plus_icon = load_icon("add-button.png", (int(50 * scale_x), int(50 * scale_y)))
-prediction_icon = load_icon("prediction.png", (int(50 * scale_x), int(50 * scale_y)))
-log_icon = load_icon("doc.png", (int(50 * scale_x), int(50 * scale_y)))
-report_icon = load_icon("report-card.png", (int(50 * scale_x), int(50 * scale_y)))
-
-# --- Frame for Buttons ---
-button_frame = tk.Frame(main_frame, bg="#E6EBEF")
-button_frame.pack()
-
-# --- Button Hover Effect ---
-def on_button_enter(e):
-    e.widget.config(bg="#F1F3F4", relief="solid", bd=2)
-
-def on_button_leave(e):
-    e.widget.config(bg="white", relief="flat", bd=0)
-
-def create_button_card(text, icon):
-    btn_card = tk.Frame(button_frame, bg="white", width=int(350 * scale_x), height=int(150 * scale_y), highlightthickness=1, highlightbackground="#D0D7DE")
-    btn_card.pack_propagate(False)
-
-    btn = tk.Button(
-        btn_card,
-        text=text,
-        image=icon,
-        compound="left",
-        font=("Segoe UI", int(20 * scale_font), "bold"),
-        bg="white",
-        fg="#1F3B4D",
-        relief="flat",
-        bd=0,
-        activebackground="#E6EBEF",
-        width=int(20 * scale_x),
-        height=int(4 * scale_y),
-        padx=int(20 * scale_x),
-        pady=int(10 * scale_y)
-    )
-    btn.pack(expand=True, fill="both")
-
-    # Bind Hover Effect
-    btn.bind("<Enter>", on_button_enter)
-    btn.bind("<Leave>", on_button_leave)
-
-    return btn_card
-
-# --- Create Buttons ---
-add_scrap_btn = create_button_card("Add Scrap", plus_icon)
-view_predictions_btn = create_button_card("View Predictions", prediction_icon)
-view_logs_btn = create_button_card("View Scrap Logs", log_icon)
-generate_report_btn = create_button_card("Generate Report", report_icon)
-
-add_scrap_btn.grid(row=0, column=0, padx=int(40 * scale_x), pady=int(20 * scale_y))
-view_predictions_btn.grid(row=0, column=1, padx=int(40 * scale_x), pady=int(20 * scale_y))
-view_logs_btn.grid(row=1, column=0, padx=int(40 * scale_x), pady=int(20 * scale_y))
-generate_report_btn.grid(row=1, column=1, padx=int(40 * scale_x), pady=int(20 * scale_y))
-
-root.mainloop()
+        btn = tk.Button(btn_card,
+                        text=f"  {text}",
+                        image=icon,
+                        compound="left",
+                        font=("Segoe UI", int(20 * self.scale_font), "bold"),
+                        bg="white",
+                        fg="#1F3B4D",
+                        relief="flat",
+                        bd=0,
+                        activebackground="#E6EBEF",
+                        padx=int(20 * self.scale_x),
+                        pady=int(10 * self.scale_y),
+                        command=lambda: self.controller.show_frame(text))
+        btn.pack(expand=True, fill="both")
+        btn.bind("<Enter>", lambda e: btn.config(bg="#F1F3F4", relief="solid", bd=2))
+        btn.bind("<Leave>", lambda e: btn.config(bg="white", relief="flat", bd=0))
+        btn.image = icon
