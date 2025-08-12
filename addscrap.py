@@ -1,409 +1,350 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkcalendar import Calendar
-from PIL import Image, ImageTk
 from datetime import datetime
-import pandas as pd
-import psycopg2
 import os
+import psycopg2
+import pandas as pd
 
-# --- Paths ---
-BASE_DIR = os.path.dirname(__file__)
-IMAGE_DIR = os.path.join(BASE_DIR, "images")
+class AddScrapFrame(tk.Frame):
+    def __init__(self, parent, controller, image_dir="./images"):
+        super().__init__(parent, bg="#F8FAFC")
+        self.controller = controller
+        self.image_dir = image_dir
 
-# --- Database ---
-def get_db_connection():
-    return psycopg2.connect(
-        dbname="scrapsense",
-        user="postgres",
-        password="",
-        host="localhost",
-        port="5432"
-    )
+        # Global caret style so insertion cursor is visible everywhere
+        self.option_add('*Entry.insertBackground', 'black')
+        self.option_add('*Text.insertBackground', 'black')
+        self.option_add('*TCombobox*insertBackground', 'black')
 
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS scrap_logs (
-            id SERIAL PRIMARY KEY,
-            machine_operator TEXT NOT NULL,
-            date TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            unit TEXT NOT NULL,
-            shift TEXT NOT NULL,
-            reason TEXT,
-            comments TEXT,
-            UNIQUE(machine_operator, date)
+        self.scale_x = self.winfo_screenwidth() / 1920
+        self.scale_y = self.winfo_screenheight() / 1080
+        self.scale_font = (self.scale_x + self.scale_y) / 2
+
+        self.fields = {}
+        self.shift_suggestions = []
+        self.build_interface()
+
+    def enable_focus(self, widget):
+        """Force widget to grab keyboard focus on click."""
+        widget.bind("<Button-1>", lambda e: e.widget.focus_set())
+
+    def get_db_connection(self):
+        return psycopg2.connect(
+            dbname="scrapsense",
+            user="postgres",
+            password="",  # Set if needed
+            host="localhost",
+            port="5432"
         )
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
 
-init_db()
+    def fetch_shift_suggestions(self):
+        try:
+            conn = self.get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT shift FROM scrap_logs ORDER BY shift ASC")
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            self.shift_suggestions = [r[0] for r in rows if r[0]]
+        except Exception:
+            self.shift_suggestions = []
+        if "shift" in self.fields:
+            current = self.fields["shift"].get().lower()
+            if current:
+                self.fields["shift"]["values"] = [s for s in self.shift_suggestions if current in s.lower()]
+            else:
+                self.fields["shift"]["values"] = self.shift_suggestions
 
-# --- Duplicate check function ---
-def entry_exists(machine_operator, date):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT 1 FROM scrap_logs WHERE machine_operator = %s AND date = %s
-    """, (machine_operator, date))
-    exists = cursor.fetchone() is not None
-    cursor.close()
-    conn.close()
-    return exists
+    def validate_date(self, date_str):
+        try:
+            datetime.strptime(date_str, "%m/%d/%Y")
+            return True
+        except ValueError:
+            return False
 
-# --- Flexible value getter for file imports ---
-def get_value(row, *possible_names, default=""):
-    for name in possible_names:
-        lname = name.lower().replace(" ", "").replace("_", "")
-        for col in row.keys():
-            c = col.lower().replace(" ", "").replace("_", "")
-            if lname == c and pd.notna(row[col]):
-                return str(row[col])
-    return default
+    def entry_exists(self, date):
+        try:
+            conn = self.get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM scrap_logs WHERE date = %s", (date,))
+            exists = cur.fetchone() is not None
+            cur.close()
+            conn.close()
+            return exists
+        except Exception:
+            return False
 
-# --- GUI Setup ---
-root = tk.Tk()
-root.title("ScrapSense - Add Scrap")
-root.configure(bg="#F8FAFC")
+    def overwrite_entry(self, date):
+        try:
+            conn = self.get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM scrap_logs WHERE date = %s", (date,))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
-screen_width = root.winfo_screenwidth()
-screen_height = root.winfo_screenheight()
-root.geometry(f"{screen_width}x{screen_height}")
+    def build_interface(self):
+        self.time_label = tk.Label(self, font=("Segoe UI", int(14*self.scale_font)),
+                                   bg="#F8FAFC", fg="#475569")
+        self.time_label.place(relx=0.98, y=int(42*self.scale_y), anchor="ne")
+        self.update_time()
 
-scale_x = screen_width / 1920
-scale_y = screen_height / 1080
-scale_font = (scale_x + scale_y) / 2
+        tk.Label(self, text="Add Scrap",
+                 font=("Segoe UI", int(44*self.scale_font), "bold"),
+                 bg="#F8FAFC", fg="#0F172A").pack(
+            pady=(int(80*self.scale_y), int(28*self.scale_y)))
 
-fields = {}
+        form_frame = tk.Frame(self, bg="white",
+                              padx=int(40*self.scale_x), pady=int(40*self.scale_y),
+                              highlightbackground="#E2E8F0", highlightthickness=1)
+        form_frame.pack()
 
-def update_time():
-    now = datetime.now()
-    time_label.config(text=now.strftime("%A, %B %d, %Y  %I:%M:%S %p"))
-    root.after(1000, update_time)
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TCombobox",
+                        fieldbackground="white", background="white",
+                        foreground="black", padding=int(5*self.scale_y))
 
-def load_icon(filename, size):
-    path = os.path.join(IMAGE_DIR, filename)
-    try:
-        img = Image.open(path).convert("RGBA")
-        img = img.resize(size, Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
-    except FileNotFoundError:
-        return None
+        # Entry Type
+        self._create_label(form_frame, "Entry Type:", 0)
+        entry_type = ttk.Combobox(form_frame,
+                                  values=["Manual Entry", "Import Document"], width=47,
+                                  font=("Segoe UI", int(12*self.scale_font)),
+                                  state="normal")
+        self.enable_focus(entry_type)
+        entry_type.set("Select Entry Type")
+        entry_type.grid(row=0, column=1, sticky="w", pady=int(10*self.scale_y))
+        entry_type.bind("<<ComboboxSelected>>", self.handle_entry_type_change)
+        self.fields["entry_type"] = entry_type
 
-def create_tooltip(widget, text):
-    tooltip = tk.Toplevel(widget)
-    tooltip.withdraw()
-    tooltip.overrideredirect(True)
-    label = tk.Label(tooltip, text=text, bg="black", fg="white", padx=5, pady=3, relief="solid", borderwidth=1)
-    label.pack()
+        # Machine Operator
+        self._create_label(form_frame, "Machine Operator (ID):", 1)
+        mop_entry = tk.Entry(form_frame, width=50,
+                             font=("Segoe UI", int(12*self.scale_font)),
+                             fg="black", bg="#F9FAFB", relief="flat",
+                             highlightthickness=2,
+                             highlightbackground="#E2E8F0",
+                             highlightcolor="#2563EB",
+                             insertbackground="black")
+        self.enable_focus(mop_entry)
+        mop_entry.grid(row=1, column=1, sticky="w", pady=int(10*self.scale_y), ipady=int(5*self.scale_y))
+        self.fields["machine_operator"] = mop_entry
 
-    def show_tooltip(event):
-        x = event.widget.winfo_rootx() + event.widget.winfo_width() + 10
-        y = event.widget.winfo_rooty() + event.widget.winfo_height() // 2
-        tooltip.geometry(f"+{x}+{y}")
-        tooltip.deiconify()
+        # Date
+        self._create_label(form_frame, "Date (MM/DD/YYYY):", 2)
+        date_frame = tk.Frame(form_frame, bg="white")
+        date_frame.grid(row=2, column=1, sticky="w", pady=int(10*self.scale_y))
+        date_entry = tk.Entry(date_frame, width=47,
+                              font=("Segoe UI", int(12*self.scale_font)),
+                              fg="black", bg="#F9FAFB", relief="flat",
+                              highlightthickness=2,
+                              highlightbackground="#E2E8F0",
+                              highlightcolor="#2563EB",
+                              insertbackground="black")
+        self.enable_focus(date_entry)
+        date_entry.insert(0, datetime.now().strftime("%m/%d/%Y"))
+        date_entry.pack(side="left", ipady=int(5*self.scale_y))
+        self.fields["date"] = date_entry
 
-    def hide_tooltip(event):
-        tooltip.withdraw()
+        calendar_icon_path = os.path.join(self.image_dir, "schedule.png")
+        if os.path.isfile(calendar_icon_path):
+            from PIL import Image, ImageTk
+            img = Image.open(calendar_icon_path).convert("RGBA")
+            img = img.resize((20, 20))
+            self.calendar_img = ImageTk.PhotoImage(img)
+            cal_btn = tk.Button(date_frame, image=self.calendar_img, command=self.open_calendar,
+                                bg="white", bd=0, cursor="hand2")
+        else:
+            cal_btn = tk.Button(date_frame, text="📅", command=self.open_calendar, bg="white", bd=0, cursor="hand2")
+        cal_btn.pack(side="left", padx=5)
+        self.cal_btn = cal_btn
 
-    widget.bind("<Enter>", show_tooltip)
-    widget.bind("<Leave>", hide_tooltip)
+        # Quantity + unit
+        self._create_label(form_frame, "Quantity:", 3)
+        qty_frame = tk.Frame(form_frame, bg="white")
+        qty_frame.grid(row=3, column=1, sticky="w", pady=int(10*self.scale_y))
+        quantity_entry = tk.Entry(qty_frame, width=30,
+                                  font=("Segoe UI", int(12*self.scale_font)),
+                                  fg="black", bg="#F9FAFB", relief="flat",
+                                  highlightthickness=2,
+                                  highlightbackground="#E2E8F0",
+                                  highlightcolor="#2563EB",
+                                  insertbackground="black")
+        self.enable_focus(quantity_entry)
+        quantity_entry.pack(side="left", ipady=int(5*self.scale_y))
+        unit_dropdown = ttk.Combobox(qty_frame, values=["lb", "kg", "units", "grams"], width=5,
+                                     font=("Segoe UI", int(12*self.scale_font)), state="normal")
+        self.enable_focus(unit_dropdown)
+        unit_dropdown.set("Select")
+        unit_dropdown.pack(side="left", padx=int(12*self.scale_x))
+        self.fields["quantity"] = quantity_entry
+        self.fields["unit"] = unit_dropdown
 
-sidebar_width = int(80 * scale_x)
-sidebar = tk.Frame(root, bg="#1E293B", width=sidebar_width)
-sidebar.pack(side="left", fill="y")
+        # Shift
+        self._create_label(form_frame, "Shift:", 4)
+        self.fetch_shift_suggestions()
+        shift_var = tk.StringVar()
+        shift_entry = ttk.Combobox(form_frame, textvariable=shift_var,
+                                   values=self.shift_suggestions,
+                                   width=47, font=("Segoe UI", int(12*self.scale_font)),
+                                   state="normal")
+        self.enable_focus(shift_entry)
+        shift_entry.set("Type or Select Shift")
+        shift_entry.grid(row=4, column=1, sticky="w", pady=int(10*self.scale_y))
+        self.fields["shift"] = shift_entry
 
-logo_img = load_icon("scraplogo.png", (int(50 * scale_x), int(50 * scale_y)))
-if logo_img:
-    tk.Label(sidebar, image=logo_img, bg="#1E293B").pack(pady=int(30 * scale_y))
+        # Reason
+        self._create_label(form_frame, "Reason:", 5)
+        reason_entry = tk.Entry(form_frame, width=50,
+                                font=("Segoe UI", int(12*self.scale_font)),
+                                fg="black", bg="#F9FAFB", relief="flat",
+                                highlightthickness=2,
+                                highlightbackground="#E2E8F0",
+                                highlightcolor="#2563EB",
+                                insertbackground="black")
+        self.enable_focus(reason_entry)
+        reason_entry.grid(row=5, column=1, sticky="w", pady=int(10*self.scale_y), ipady=int(5*self.scale_y))
+        self.fields["reason"] = reason_entry
 
-nav_icons = [
-    ("dashboard.png", "Dashboard"),
-    ("add-button.png", "Add Scrap"),
-    ("prediction.png", "Predictions"),
-    ("doc.png", "Scrap Logs"),
-    ("report-card.png", "Reports"),
-    ("setting.png", "Settings")
-]
+        # Comments
+        self._create_label(form_frame, "Additional Comments:", 6)
+        comments_text = tk.Text(form_frame, width=50, height=5,
+                                font=("Segoe UI", int(12*self.scale_font)),
+                                fg="black", bg="#F9FAFB", relief="flat",
+                                highlightthickness=2,
+                                highlightbackground="#E2E8F0",
+                                highlightcolor="#2563EB",
+                                insertbackground="black")
+        self.enable_focus(comments_text)
+        comments_text.grid(row=6, column=1, sticky="w", pady=int(10*self.scale_y))
+        self.fields["comments"] = comments_text
 
-def on_enter_sidebar(e):
-    e.widget.config(bg="#334155")
+        # Submit Button
+        style.configure("Green.TButton",
+                        background="#22C55E", foreground="white",
+                        font=("Segoe UI", int(16 * self.scale_font), "bold"),
+                        padding=int(10 * self.scale_y))
+        style.map("Green.TButton", background=[("active", "#16A34A")])
+        ttk.Button(self, text="Submit Scrap Entry", style="Green.TButton",
+                   cursor="hand2", command=self.submit_scrap_entry).pack(
+            pady=int(30 * self.scale_y), ipady=int(5 * self.scale_y))
 
-def on_leave_sidebar(e):
-    e.widget.config(bg="#1E293B")
+    def _create_label(self, parent, text, row):
+        tk.Label(parent, text=text, font=("Segoe UI", int(14*self.scale_font), "bold"),
+                 bg="white", fg="#334155", anchor="w").grid(
+            row=row, column=0, sticky="w", pady=int(10*self.scale_y), padx=int(10*self.scale_x))
 
-for icon_path, tooltip in nav_icons:
-    icon_img = load_icon(icon_path, (int(30 * scale_x), int(30 * scale_y)))
-    btn = tk.Label(sidebar, image=icon_img, bg="#1E293B", width=sidebar_width, height=int(60 * scale_y))
-    btn.image = icon_img
-    btn.pack(pady=int(5 * scale_y))
-    btn.bind("<Enter>", on_enter_sidebar)
-    btn.bind("<Leave>", on_leave_sidebar)
-    create_tooltip(btn, tooltip)
+    def update_time(self):
+        now = datetime.now()
+        self.time_label.config(text=now.strftime("%A, %B %d, %Y  %I:%M:%S %p"))
+        self.after(1000, self.update_time)
 
-main_frame = tk.Frame(root, bg="#F8FAFC")
-main_frame.pack(side="left", fill="both", expand=True)
+    def open_calendar(self):
+        top = tk.Toplevel(self)
+        top.title("Select Date")
+        cal = Calendar(top, selectmode="day", year=datetime.now().year,
+                       month=datetime.now().month, day=datetime.now().day)
+        cal.pack(pady=20)
+        def pick_date():
+            self.fields["date"].delete(0, tk.END)
+            self.fields["date"].insert(0, cal.get_date())
+            top.destroy()
+        ttk.Button(top, text="Select", command=pick_date).pack(pady=10)
 
-username = "Akshay"
-tk.Label(main_frame, text=f"Welcome, {username}",
-         font=("Segoe UI", int(24 * scale_font), "bold"),
-         bg="#F8FAFC", fg="#1E293B").place(x=int(100 * scale_x), y=int(50 * scale_y))
+    def handle_entry_type_change(self, event):
+        if self.fields["entry_type"].get() == "Import Document":
+            self.import_document()
 
-time_label = tk.Label(main_frame, font=("Segoe UI", int(14 * scale_font)),
-                      bg="#F8FAFC", fg="#475569")
-time_label.place(relx=0.98, y=int(40 * scale_y), anchor="ne")
-update_time()
-
-tk.Label(main_frame, text="Add Scrap",
-         font=("Segoe UI", int(46 * scale_font), "bold"),
-         bg="#F8FAFC", fg="#0F172A").pack(pady=(int(80 * scale_y), int(40 * scale_y)))
-
-form_frame = tk.Frame(main_frame, bg="white",
-                      padx=int(40 * scale_x), pady=int(40 * scale_y),
-                      highlightbackground="#E2E8F0", highlightthickness=1)
-form_frame.pack(pady=int(20 * scale_y))
-
-style = ttk.Style()
-style.theme_use("clam")
-style.configure("TCombobox", fieldbackground="white", background="white", foreground="black", padding=int(5 * scale_y))
-
-tk.Label(form_frame, text="Entry Type:", font=("Segoe UI", int(14 * scale_font), "bold"),
-         bg="white", fg="#334155").grid(row=0, column=0, sticky="w",
-                                        pady=int(12 * scale_y), padx=int(10 * scale_x))
-
-entry_type = ttk.Combobox(form_frame, values=["Manual Entry", "Import Document"],
-                          width=int(47 * scale_x), font=("Segoe UI", int(12 * scale_font)))
-entry_type.set("Select Entry Type")
-entry_type.grid(row=0, column=1, pady=int(12 * scale_y))
-fields["entry_type"] = entry_type
-
-def handle_entry_type_change(event):
-    if entry_type.get() == "Import Document":
-        import_document()
-
-entry_type.bind("<<ComboboxSelected>>", handle_entry_type_change)
-
-def create_field(label_text, key, row, is_textbox=False, is_dropdown=False, default="", inline_widget=None):
-    tk.Label(form_frame, text=label_text, font=("Segoe UI", int(14 * scale_font), "bold"),
-             bg="white", fg="#334155", anchor="w").grid(row=row, column=0, sticky="w",
-                                                        pady=int(12 * scale_y), padx=int(10 * scale_x))
-
-    if inline_widget:
-        inline_widget.grid(row=row, column=1, pady=int(12 * scale_y), sticky="w")
-        return inline_widget
-    elif is_textbox:
-        entry = tk.Text(form_frame, width=int(50 * scale_x), height=5,
-                        font=("Segoe UI", int(12 * scale_font)),
-                        fg="black", bg="#F9FAFB", relief="flat",
-                        highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
-        entry.grid(row=row, column=1, pady=int(12 * scale_y), ipady=int(5 * scale_y))
-        fields[key] = entry
-        return entry
-    elif is_dropdown:
-        entry = ttk.Combobox(form_frame, values=["Morning", "Afternoon", "Night"],
-                             width=int(47 * scale_x), font=("Segoe UI", int(12 * scale_font)))
-        entry.set(default or "Select Shift")
-        entry.grid(row=row, column=1, pady=int(12 * scale_y))
-        fields[key] = entry
-        return entry
-    else:
-        entry = tk.Entry(form_frame, width=int(50 * scale_x), font=("Segoe UI", int(12 * scale_font)),
-                         fg="black", bg="#F9FAFB", relief="flat",
-                         highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
-        entry.insert(0, default)
-        entry.grid(row=row, column=1, pady=int(12 * scale_y), ipady=int(5 * scale_y))
-        fields[key] = entry
-        return entry
-
-create_field("Machine Operator (ID):", "machine_operator", 1)
-
-# Date Field
-tk.Label(form_frame, text="Date (MM/DD/YYYY):", font=("Segoe UI", int(14 * scale_font), "bold"),
-         bg="white", fg="#334155", anchor="w").grid(row=2, column=0, sticky="w",
-                                                    pady=int(12 * scale_y), padx=int(10 * scale_x))
-
-date_frame = tk.Frame(form_frame, bg="white")
-date_frame.grid(row=2, column=1, pady=int(12 * scale_y), sticky="w")
-
-fields["date"] = tk.Entry(date_frame, width=int(47 * scale_x),
-                          font=("Segoe UI", int(12 * scale_font)),
-                          fg="black", bg="#F9FAFB", relief="flat",
-                          highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
-fields["date"].insert(0, datetime.now().strftime("%m/%d/%Y"))
-fields["date"].pack(side="left", ipady=int(5 * scale_y))
-
-def open_calendar():
-    top = tk.Toplevel(root)
-    top.title("Select Date")
-    cal = Calendar(top, selectmode="day", year=datetime.now().year,
-                   month=datetime.now().month, day=datetime.now().day)
-    cal.pack(pady=20)
-
-    def pick_date():
-        fields["date"].delete(0, tk.END)
-        fields["date"].insert(0, cal.get_date())
-        top.destroy()
-
-    ttk.Button(top, text="Select", command=pick_date).pack(pady=10)
-
-calendar_icon = load_icon("schedule.png", (int(20 * scale_x), int(20 * scale_y)))
-if calendar_icon:
-    tk.Button(date_frame, image=calendar_icon, command=open_calendar,
-              bg="white", bd=0, cursor="hand2").pack(side="left", padx=int(5 * scale_x))
-
-# Quantity & Unit
-quantity_frame = tk.Frame(form_frame, bg="white")
-quantity_entry = tk.Entry(quantity_frame, width=int(30 * scale_x),
-                          font=("Segoe UI", int(12 * scale_font)),
-                          fg="black", bg="#F9FAFB", relief="flat",
-                          highlightthickness=2, highlightbackground="#E2E8F0", highlightcolor="#2563EB")
-quantity_entry.pack(side="left", ipady=int(5 * scale_y))
-
-unit_dropdown = ttk.Combobox(quantity_frame, values=["lb", "kg", "units", "grams"],
-                             width=5, font=("Segoe UI", int(12 * scale_font)))
-unit_dropdown.set("Select")
-unit_dropdown.pack(side="left", padx=int(10 * scale_x))
-
-fields["quantity"] = quantity_entry
-fields["unit"] = unit_dropdown
-
-create_field("Quantity:", None, 3, inline_widget=quantity_frame)
-create_field("Shift:", "shift", 4, is_dropdown=True)
-create_field("Reason:", "reason", 5)
-create_field("Additional Comments:", "comments", 6, is_textbox=True)
-
-# --- Enhanced import_document() ---
-def import_document():
-    try:
-        file_path = filedialog.askopenfilename(
-            title="Select Document",
-            filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
-        )
-        if not file_path:
+    def submit_scrap_entry(self):
+        machine_operator = self.fields["machine_operator"].get().strip()
+        date = self.fields["date"].get().strip()
+        quantity = self.fields["quantity"].get().strip()
+        unit = self.fields["unit"].get().strip()
+        shift = self.fields["shift"].get().strip()
+        reason = self.fields["reason"].get().strip()
+        comments = self.fields["comments"].get("1.0", tk.END).strip()
+        if not machine_operator or not date or not quantity or not shift or "Select" in shift or not unit or unit == "Select":
+            messagebox.showerror("Validation Error", "Please fill in all required fields.")
             return
-
-        df = pd.read_csv(file_path) if file_path.endswith(".csv") else pd.read_excel(file_path)
-        if df.empty:
-            messagebox.showwarning("Empty File", "The selected file has no data.")
+        if not self.validate_date(date):
+            messagebox.showerror("Validation Error", "Date must be in MM/DD/YYYY format.")
             return
+        try:
+            quantity_num = float(quantity)
+            if quantity_num <= 0: raise ValueError
+        except ValueError:
+            messagebox.showerror("Validation Error", "Quantity must be a positive number.")
+            return
+        shift_normalized = shift.upper().strip()
+        if self.entry_exists(date):
+            if not messagebox.askyesno("Duplicate Date Entry",
+                                       f"There is already an entry for {date}. Do you wish to overwrite it?"):
+                return
+            self.overwrite_entry(date)
+        try:
+            conn = self.get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (machine_operator, date, quantity_num, unit, shift_normalized, reason, comments))
+            conn.commit()
+            cur.close()
+            conn.close()
+            messagebox.showinfo("Success", "Scrap entry saved successfully!")
+            self.fetch_shift_suggestions()
+        except Exception as e:
+            messagebox.showerror("Database Error", f"An error occurred: {e}")
 
-        df.columns = df.columns.str.strip()  # Clean column names
-
-        inserted, skipped = 0, 0
-        last_good = {}
-        for _, row in df.iterrows():
-            mop = get_value(row, "machine operator id", "operator id", "operator")
-            date = get_value(row, "date", default=datetime.now().strftime("%m/%d/%Y"))
-            qty = get_value(row, "quantity", "scrap quantity")
-            unit = get_value(row, "unit", "measurement unit", default="lb")
-            shift = get_value(row, "shift", default="Select Shift")
-            reason = get_value(row, "reason", "scrap reason")
-            comments = get_value(row, "comments", "notes")
-
-            # Skip empty/incomplete
-            if not mop or not date or not qty or shift == "Select Shift" or not unit:
-                continue
-
-            if entry_exists(mop, date):
-                skipped += 1
-                continue
-
-            try:
-                qty = float(qty)
-            except ValueError:
-                continue
-
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (mop, date, qty, unit, shift, reason, comments))
-                conn.commit()
-                cursor.close()
-                conn.close()
-                inserted += 1
-                last_good = dict(machine_operator=mop, date=date, quantity=qty, unit=unit, shift=shift, reason=reason, comments=comments)
-            except psycopg2.errors.UniqueViolation:
-                skipped += 1
-            except Exception:
-                skipped += 1
-
-        # Feedback to user
-        message = f"Imported {inserted} records."
-        if skipped:
-            message += f" Skipped {skipped} duplicate or invalid rows."
-        messagebox.showinfo("Import Result", message)
-
-        # Fill UI fields with last imported row
-        if inserted > 0 and last_good:
-            fields["machine_operator"].delete(0, tk.END)
-            fields["machine_operator"].insert(0, last_good["machine_operator"])
-            fields["date"].delete(0, tk.END)
-            fields["date"].insert(0, last_good["date"])
-            fields["quantity"].delete(0, tk.END)
-            fields["quantity"].insert(0, last_good["quantity"])
-            fields["unit"].set(last_good["unit"])
-            fields["shift"].set(last_good["shift"])
-            fields["reason"].delete(0, tk.END)
-            fields["reason"].insert(0, last_good["reason"])
-            fields["comments"].delete("1.0", tk.END)
-            fields["comments"].insert("1.0", last_good["comments"])
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to import file:\n{e}")
-
-# --- Enhanced submit_scrap_entry() ---
-def submit_scrap_entry():
-    machine_operator = fields["machine_operator"].get().strip()
-    date = fields["date"].get().strip()
-    quantity = fields["quantity"].get().strip()
-    unit = fields["unit"].get().strip()
-    shift = fields["shift"].get().strip()
-    reason = fields["reason"].get().strip()
-    comments = fields["comments"].get("1.0", tk.END).strip()
-
-    if not machine_operator or not date or not quantity or shift == "Select Shift" or not unit:
-        messagebox.showerror("Validation Error", "Please fill in all required fields.")
-        return
-
-    try:
-        quantity = float(quantity)
-    except ValueError:
-        messagebox.showerror("Validation Error", "Quantity must be a number.")
-        return
-
-    if entry_exists(machine_operator, date):
-        messagebox.showerror("Duplicate Entry", "An entry for this operator and date already exists.")
-        return
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (machine_operator, date, quantity, unit, shift, reason, comments))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        messagebox.showinfo("Success", "Scrap entry saved successfully!")
-    except psycopg2.errors.UniqueViolation:
-        messagebox.showerror("Duplicate Entry", "An entry for this operator and date already exists.")
-    except Exception as e:
-        messagebox.showerror("Database Error", f"An error occurred: {e}")
-
-style.configure("Green.TButton",
-                background="#22C55E", foreground="white",
-                font=("Segoe UI", int(16 * scale_font), "bold"),
-                padding=int(10 * scale_y))
-style.map("Green.TButton", background=[("active", "#16A34A")])
-
-ttk.Button(main_frame, text="Submit Scrap Entry", style="Green.TButton",
-           cursor="hand2", command=submit_scrap_entry).pack(pady=int(30 * scale_y), ipady=int(5 * scale_y))
-
-root.mainloop()
+    def import_document(self):
+        file_path = filedialog.askopenfilename(title="Select Document",
+                                               filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls")])
+        if not file_path: return
+        try:
+            df = pd.read_csv(file_path) if file_path.endswith(".csv") else pd.read_excel(file_path)
+            if df.empty:
+                messagebox.showwarning("Empty File", "The selected file has no data.")
+                return
+            inserted, overwritten = 0, 0
+            for _, row in df.iterrows():
+                mop = row.get("machine operator id", "")
+                date = row.get("date", datetime.now().strftime("%m/%d/%Y"))
+                qty = row.get("quantity", "")
+                unit = row.get("unit", "lb")
+                shift = str(row.get("shift", "")).strip().upper()
+                reason = row.get("reason", "")
+                comments = row.get("comments", "")
+                if not mop or not date or not qty or not shift or shift == "Select Shift" or not unit or unit == "Select":
+                    continue
+                try:
+                    qty_num = float(qty)
+                    if qty_num <= 0:
+                        continue
+                except ValueError:
+                    continue
+                if self.entry_exists(date):
+                    if not messagebox.askyesno("Duplicate Date Entry", f"There is already an entry for {date}. Do you wish to overwrite it?"):
+                        continue
+                    self.overwrite_entry(date)
+                    overwritten += 1
+                try:
+                    conn = self.get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO scrap_logs (machine_operator, date, quantity, unit, shift, reason, comments)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (mop, date, qty_num, unit, shift, reason, comments))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    inserted += 1
+                except Exception:
+                    continue
+            self.fetch_shift_suggestions()
+            messagebox.showinfo("Import Result",
+                                f"Imported {inserted} records successfully.\nOverwritten: {overwritten} records.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Import failed: {e}")
