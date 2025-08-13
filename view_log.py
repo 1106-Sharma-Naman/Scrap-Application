@@ -6,6 +6,21 @@ from datetime import datetime
 import psycopg2
 import os
 
+# =========================
+# DB CONFIG (env-friendly)
+# =========================
+# On your Mac (server) you can leave PGHOST=127.0.0.1 while testing.
+# On your friend's Windows PC, set PGHOST to your Tailscale IP.
+PG_HOST = os.getenv("PGHOST", "127.0.0.1")
+PG_DB   = os.getenv("PGDATABASE", "scrapsense")
+PG_USER = os.getenv("PGUSER", "scrapsense")
+PG_PASS = os.getenv("PGPASSWORD", "scrapsense2006")
+PG_PORT = int(os.getenv("PGPORT", "5432"))
+
+ADD_TOTAL_PRODUCED_SQL = """
+ALTER TABLE public.scrap_logs
+ADD COLUMN IF NOT EXISTS total_produced NUMERIC;
+"""
 
 class ViewLogFrame(tk.Frame):
     def __init__(self, parent, controller):
@@ -24,30 +39,41 @@ class ViewLogFrame(tk.Frame):
         self.scale_font = (self.scale_x + self.scale_y) / 2
 
         self.shift_suggestions = []
+
+        # Make sure critical column exists (align with Add page)
+        self.ensure_total_produced_column()
+
         self.build_ui()
         self.after(0, self.fetch_data)
 
+    # ---------------- Helpers ----------------
     def enable_focus(self, widget):
-        """Force widget to grab focus on click."""
         widget.bind("<Button-1>", lambda e: e.widget.focus_set())
 
     def get_db_connection(self):
         return psycopg2.connect(
-            dbname="scrapsense",
-            user="postgres",
-            password="",
-            host="localhost",
-            port="5432"
+            dbname=PG_DB,
+            user=PG_USER,
+            password=PG_PASS,
+            host=PG_HOST,
+            port=str(PG_PORT),
+            connect_timeout=5,
+            application_name="ScrapSense_ViewLog"
         )
+
+    def ensure_total_produced_column(self):
+        try:
+            with self.get_db_connection() as conn, conn.cursor() as cur:
+                cur.execute(ADD_TOTAL_PRODUCED_SQL)
+                conn.commit()
+        except Exception as e:
+            print("ensure_total_produced_column warning:", e)
 
     def fetch_shift_suggestions(self):
         try:
-            conn = self.get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT shift FROM scrap_logs ORDER BY shift ASC")
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
+            with self.get_db_connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT shift FROM public.scrap_logs WHERE shift IS NOT NULL AND shift <> '' ORDER BY shift ASC")
+                rows = cur.fetchall()
             self.shift_suggestions = ["All"] + [r[0] for r in rows if r[0]]
         except Exception:
             self.shift_suggestions = ["All"]
@@ -101,6 +127,7 @@ class ViewLogFrame(tk.Frame):
             self.after_cancel(self._live_search_after_id)
         self._live_search_after_id = self.after(300, self.fetch_data)
 
+    # ---------------- UI ----------------
     def build_ui(self):
         tk.Label(self, text="Scrap Logs",
                  font=("Segoe UI", int(36 * self.scale_font), "bold"),
@@ -191,11 +218,25 @@ class ViewLogFrame(tk.Frame):
                         font=("Segoe UI", int(12 * self.scale_font), "bold"))
         style.map("Treeview", background=[("selected", "#3E84FB")], foreground=[("selected", "white")])
 
-        columns = ("id", "machine_operator", "date", "quantity", "unit", "shift", "reason", "comments")
+        # NOTE: include total_produced so it matches Add page & DB
+        columns = ("id", "machine_operator", "date", "quantity", "unit", "total_produced", "shift", "reason", "comments")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=20, style="Treeview")
+        pretty = {
+            "id": "ID",
+            "machine_operator": "Machine Operator",
+            "date": "Date",
+            "quantity": "Quantity",
+            "unit": "Unit",
+            "total_produced": "Total Produced",
+            "shift": "Shift",
+            "reason": "Reason",
+            "comments": "Comments",
+        }
         for col in columns:
-            self.tree.heading(col, text=col.replace("_", " ").title())
-            self.tree.column(col, width=int(150 * self.scale_x), anchor="center")
+            self.tree.heading(col, text=pretty[col])
+            # wider columns for comments & reason
+            width = 220 if col in ("comments", "reason") else 150
+            self.tree.column(col, width=int(width * self.scale_x), anchor="center")
         self.tree.pack(fill="both", expand=True)
 
         btn_frame = tk.Frame(self, bg="#F8FAFC")
@@ -204,32 +245,55 @@ class ViewLogFrame(tk.Frame):
         ttk.Button(btn_frame, text="Delete", command=self.delete_selected_entry).grid(row=0, column=1, padx=5)
         ttk.Button(btn_frame, text="Edit", command=self.open_edit_window).grid(row=0, column=2, padx=5)
 
+    # ---------------- Data ----------------
     def fetch_data(self):
-        conn = self.get_db_connection()
-        c = conn.cursor()
-        query = "SELECT * FROM scrap_logs WHERE 1=1"
-        params = []
-        if self.operator_entry.get().strip() and self.operator_entry.get() != "Search Operator":
-            query += " AND machine_operator ILIKE %s"
-            params.append(f"%{self.operator_entry.get().strip()}%")
-        if self.shift_combo.get() != "All" and self.shift_combo.get().strip():
-            query += " AND shift ILIKE %s"
-            params.append(f"%{self.shift_combo.get().strip()}%")
-        if self.from_date.get().strip() and self.from_date.get() != "MM/DD/YYYY":
-            query += " AND date >= %s"
-            params.append(self.from_date.get().strip())
-        if self.to_date.get().strip() and self.to_date.get() != "MM/DD/YYYY":
-            query += " AND date <= %s"
-            params.append(self.to_date.get().strip())
-        c.execute(query, tuple(params))
-        rows = c.fetchall()
-        conn.close()
-        self.tree.delete(*self.tree.get_children())
-        for i, row in enumerate(rows):
-            tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-            self.tree.insert("", tk.END, values=row, tags=(tag,))
-        self.tree.tag_configure('evenrow', background="#F8FAFC")
-        self.tree.tag_configure('oddrow', background="#E2E8F0")
+        try:
+            conn = self.get_db_connection()
+            cur = conn.cursor()
+
+            # Build WHERE with optional filters. Use to_date() so text dates compare correctly.
+            where = ["1=1"]
+            params = []
+
+            op_val = self.operator_entry.get().strip()
+            if op_val and op_val != "Search Operator":
+                where.append("machine_operator ILIKE %s")
+                params.append(f"%{op_val}%")
+
+            shift_val = self.shift_combo.get().strip()
+            if shift_val and shift_val != "All":
+                where.append("shift ILIKE %s")
+                params.append(f"%{shift_val}%")
+
+            from_val = self.from_date.get().strip()
+            if from_val and from_val != "MM/DD/YYYY":
+                where.append("to_date(date, 'MM/DD/YYYY') >= to_date(%s, 'MM/DD/YYYY')")
+                params.append(from_val)
+
+            to_val = self.to_date.get().strip()
+            if to_val and to_val != "MM/DD/YYYY":
+                where.append("to_date(date, 'MM/DD/YYYY') <= to_date(%s, 'MM/DD/YYYY')")
+                params.append(to_val)
+
+            query = f"""
+                SELECT id, machine_operator, date, quantity, unit, COALESCE(total_produced, 0), shift, reason, comments
+                FROM public.scrap_logs
+                WHERE {' AND '.join(where)}
+                ORDER BY to_date(date, 'MM/DD/YYYY') DESC, id DESC
+            """
+
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+            conn.close()
+
+            self.tree.delete(*self.tree.get_children())
+            for i, row in enumerate(rows):
+                tag = 'evenrow' if i % 2 == 0 else 'oddrow'
+                self.tree.insert("", tk.END, values=row, tags=(tag,))
+            self.tree.tag_configure('evenrow', background="#F8FAFC")
+            self.tree.tag_configure('oddrow', background="#E2E8F0")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to fetch data:\n{e}")
 
     def reset_filters(self):
         self.operator_entry.delete(0, tk.END)
@@ -252,8 +316,8 @@ class ViewLogFrame(tk.Frame):
             record_id = self.tree.item(selected[0])["values"][0]
             try:
                 conn = self.get_db_connection()
-                c = conn.cursor()
-                c.execute("DELETE FROM scrap_logs WHERE id = %s", (record_id,))
+                cur = conn.cursor()
+                cur.execute("DELETE FROM public.scrap_logs WHERE id = %s", (record_id,))
                 conn.commit()
                 conn.close()
                 self.fetch_data()
@@ -268,22 +332,27 @@ class ViewLogFrame(tk.Frame):
             return
         values = self.tree.item(selected[0])["values"]
         record_id = values[0]
+
         edit_win = tk.Toplevel(self)
         edit_win.title("Edit Scrap Log")
         edit_win.configure(bg="#F8FAFC")
         edit_win.grab_set()
         edit_win.resizable(False, False)
+
         entry_fields = {}
         self.fetch_shift_suggestions()
+
         labels = [
             ("Machine Operator (ID):", "machine_operator", values[1]),
             ("Date (MM/DD/YYYY):", "date", values[2]),
             ("Quantity:", "quantity", values[3]),
             ("Unit:", "unit", values[4]),
-            ("Shift:", "shift", values[5]),
-            ("Reason:", "reason", values[6]),
-            ("Comments:", "comments", values[7]),
+            ("Total Produced:", "total_produced", values[5]),
+            ("Shift:", "shift", values[6]),
+            ("Reason:", "reason", values[7]),
+            ("Comments:", "comments", values[8]),
         ]
+
         for i, (lbl, key, val) in enumerate(labels):
             tk.Label(edit_win, text=lbl, font=("Segoe UI", 12, "bold"),
                      anchor="w", bg="#F8FAFC", fg="#334155").grid(row=i, column=0, sticky="w", padx=12, pady=7)
@@ -311,37 +380,46 @@ class ViewLogFrame(tk.Frame):
             entry_fields[key] = entry
 
         def save_changes():
-            mop = entry_fields["machine_operator"].get().strip()
-            date = entry_fields["date"].get().strip()
-            qty = entry_fields["quantity"].get().strip()
-            unit = entry_fields["unit"].get().strip()
-            shift = entry_fields["shift"].get().strip().upper()
-            reason = entry_fields["reason"].get().strip()
-            comments = entry_fields["comments"].get("1.0", tk.END).strip()
-            if not mop or not date or not qty or not unit or not shift:
-                messagebox.showerror("Validation Error", "Required fields are missing.")
-                return
             try:
+                mop = entry_fields["machine_operator"].get().strip()
+                date = entry_fields["date"].get().strip()
+                qty = entry_fields["quantity"].get().strip()
+                unit = entry_fields["unit"].get().strip()
+                tot_prod = entry_fields["total_produced"].get().strip()
+                shift = entry_fields["shift"].get().strip().upper()
+                reason = entry_fields["reason"].get().strip()
+                comments = entry_fields["comments"].get("1.0", tk.END).strip()
+
+                if not mop or not date or not qty or not unit or not shift:
+                    messagebox.showerror("Validation Error", "Required fields are missing.")
+                    return
+
+                # Basic validation
                 datetime.strptime(date, "%m/%d/%Y")
                 qty_val = float(qty)
                 if qty_val <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Validation Error", "Invalid quantity or date.")
-                return
-            try:
+                    raise ValueError("Quantity must be positive")
+                tot_val = float(tot_prod) if tot_prod else None
+                if tot_val is not None and tot_val <= 0:
+                    raise ValueError("Total Produced must be positive")
+
                 conn = self.get_db_connection()
-                c = conn.cursor()
-                c.execute("""
-                    UPDATE scrap_logs
-                    SET machine_operator=%s, date=%s, quantity=%s, unit=%s, shift=%s, reason=%s, comments=%s
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE public.scrap_logs
+                    SET machine_operator=%s, date=%s, quantity=%s, unit=%s,
+                        total_produced=%s, shift=%s, reason=%s, comments=%s
                     WHERE id=%s
-                """, (mop, date, qty_val, unit, shift, reason, comments, record_id))
+                """, (mop, date, qty_val, unit, tot_val, shift, reason, comments, record_id))
                 conn.commit()
                 conn.close()
+
                 messagebox.showinfo("Updated", "Log updated successfully.")
                 edit_win.destroy()
                 self.fetch_data()
+
+            except ValueError as ve:
+                messagebox.showerror("Validation Error", str(ve))
             except Exception as e:
                 messagebox.showerror("Error", f"Could not update entry:\n{e}")
 
