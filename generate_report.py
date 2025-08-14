@@ -64,15 +64,33 @@ LOGO_PATH             = "scrapsense_logo.png"
 DEFAULT_SAVE_NAME     = "ScrapSense_Report.pdf"
 
 # ===============================
-# DB CONNECTION
+# DB CONNECTION (env-based)
 # ===============================
+def _env(name: str, default: str | None = None) -> str | None:
+    val = os.getenv(name)
+    return val if (val is not None and val != "") else default
+
 def get_db_connection():
+    """
+    Reads PG* env vars. Defaults:
+      host=127.0.0.1 port=5432 db=scrapsense user=scrapsense
+    We also set search_path=public so unqualified names resolve there.
+    """
+    host = _env("PGHOST", "127.0.0.1")
+    port = int(_env("PGPORT", "5432"))
+    db   = _env("PGDATABASE", "scrapsense")
+    user = _env("PGUSER", "scrapsense")
+    pwd  = _env("PGPASSWORD", "")
+
+    # options can push session GUCs at connect time
     return psycopg2.connect(
-        dbname="scrapsense",
-        user="postgres",
-        password="",  # add if needed
-        host="localhost",
-        port="5432"
+        dbname=db,
+        user=user,
+        password=pwd,
+        host=host,
+        port=port,
+        connect_timeout=10,
+        options="-c search_path=public"
     )
 
 def table_has_column(conn, table_name: str, column_name: str, schema: str = "public") -> bool:
@@ -106,15 +124,15 @@ def load_icon(filename, size):
 # ===============================
 def load_scrap_data(start_date, end_date, shift=None, operator=None, reason=None):
     """
-    Loads scrap data into a DataFrame.
-    Columns included automatically if they exist:
+    Loads scrap data into a DataFrame from public.scrap_logs.
+    Includes optional columns automatically if present:
       - entry_type
       - total_produced
     """
     conn = get_db_connection()
     try:
-        has_entry_type = table_has_column(conn, "scrap_logs", "entry_type")
-        has_total_prod = table_has_column(conn, "scrap_logs", "total_produced")
+        has_entry_type = table_has_column(conn, "scrap_logs", "entry_type", "public")
+        has_total_prod = table_has_column(conn, "scrap_logs", "total_produced", "public")
 
         select_cols = [
             "id",
@@ -146,9 +164,8 @@ def load_scrap_data(start_date, end_date, shift=None, operator=None, reason=None
 
         where_clause = " AND ".join(conditions)
         query = f"""
-            SELECT
-                {", ".join(select_cols)}
-            FROM scrap_logs
+            SELECT {", ".join(select_cols)}
+            FROM public.scrap_logs
             WHERE {where_clause}
             ORDER BY date ASC, id ASC
         """
@@ -166,7 +183,6 @@ def load_scrap_data(start_date, end_date, shift=None, operator=None, reason=None
 
         # add scrap_percent if we have total_produced
         if "total_produced" in df.columns:
-            # avoid divide-by-zero
             df["scrap_percent"] = df.apply(
                 lambda r: (float(r["quantity"]) / float(r["total_produced"]) * 100.0)
                 if pd.notnull(r["total_produced"]) and float(r["total_produced"]) > 0 else None,
@@ -208,7 +224,7 @@ def compute_kpis(df: pd.DataFrame):
 def make_line_chart(df: pd.DataFrame, out_path: str):
     # Daily total
     daily = df.groupby("date")["quantity"].sum()
-    plt.figure(figsize=(7.5, 3.2), dpi=160)  # a bit wider
+    plt.figure(figsize=(7.5, 3.2), dpi=160)
     plt.plot(daily.index, daily.values, marker="o")
     plt.title("Scrap by Day")
     plt.xlabel("Date")
@@ -324,7 +340,6 @@ def build_pdf(df: pd.DataFrame, kpis: dict, start_date: date, end_date: date, sa
         make_line_chart(df, line_path)
         make_reason_pie(df, pie_path)
 
-        # Make both charts consume the width nicely
         charts_tbl = Table([
             [
                 RLImage(line_path, width=4.5*inch, height=2.2*inch),
@@ -351,11 +366,9 @@ def build_pdf(df: pd.DataFrame, kpis: dict, start_date: date, end_date: date, sa
             base_cols += ["entry_type"]
         base_cols += ["comments"]
 
-        # Convert to strings and wrap long fields
         table_header = [Paragraph(f"<b>{c.replace('_', ' ').title()}</b>", styles["CellBold"]) for c in base_cols]
         data_tbl = [table_header]
 
-        # Create wrapped rows
         def fmt_num(val, nd=2):
             try:
                 return f"{float(val):.{nd}f}"
@@ -373,23 +386,16 @@ def build_pdf(df: pd.DataFrame, kpis: dict, start_date: date, end_date: date, sa
                 else:
                     v = "" if pd.isna(v) else str(v)
 
-                # Wrap longer text columns
-                if c in ("reason", "comments", "machine_operator"):
-                    row.append(Paragraph(v, styles["Cell"]))
-                else:
-                    row.append(Paragraph(v, styles["Cell"]))
+                row.append(Paragraph(v, styles["Cell"]))
             data_tbl.append(row)
 
-        # Column width plan (fractions of available width)
         avail_w = page_w - doc.leftMargin - doc.rightMargin
-        # Start with sensible defaults
         width_map = {
             "date": 0.10, "shift": 0.09, "machine_operator": 0.15,
             "reason": 0.14, "quantity": 0.09, "unit": 0.07,
             "total_produced": 0.11, "scrap_percent": 0.10,
             "entry_type": 0.09, "comments": 0.16
         }
-        # Keep only present columns & normalize so sum = 1
         fracs = [width_map[c] for c in base_cols]
         s = sum(fracs)
         fracs = [f/s for f in fracs]
@@ -457,13 +463,11 @@ class GenerateReportFrame(tk.Frame):
                         font=(FONT_FAMILY, 11, "bold"))
         style.map("Treeview", background=[("selected", "#DBEAFE")])
 
-    # ---- calendar popup identical behavior to AddScrap ----
     def _open_calendar_for(self, target_entry):
         top = tk.Toplevel(self)
         top.title("Select Date")
         top.transient(self.winfo_toplevel())
         top.grab_set()
-        # position near the entry
         x = target_entry.winfo_rootx()
         y = target_entry.winfo_rooty() + target_entry.winfo_height() + 6
         top.geometry(f"+{x}+{y}")
@@ -474,7 +478,6 @@ class GenerateReportFrame(tk.Frame):
 
         def pick_date():
             raw = cal.get_date()
-            # normalize to yyyy-mm-dd
             dt = None
             for fmt in ("%m/%d/%y", "%m/%d/%Y"):
                 try:
@@ -501,7 +504,6 @@ class GenerateReportFrame(tk.Frame):
             self._calendar_imgs.append(img)
         return btn
 
-    # ---------- UI ----------
     def _build(self):
         # Header
         header_row = tk.Frame(self, bg=APP_BG)
@@ -590,7 +592,6 @@ class GenerateReportFrame(tk.Frame):
         table_wrap = tk.Frame(self, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_COLOR)
         table_wrap.pack(fill="both", expand=True, padx=24, pady=12)
 
-        # Columns for the preview table (include optional ones)
         base_cols = ("date", "shift", "machine_operator", "reason", "quantity", "unit",
                      "total_produced", "scrap_percent", "entry_type", "comments")
         self.tree = ttk.Treeview(table_wrap, columns=base_cols, show="headings")
@@ -616,7 +617,6 @@ class GenerateReportFrame(tk.Frame):
         vsb.pack(side="right", fill="y")
         hsb.pack(side="bottom", fill="x")
 
-        # Alternate row tags
         self.tree.tag_configure("odd", background=ROW_A)
         self.tree.tag_configure("even", background=ROW_B)
 
@@ -627,7 +627,6 @@ class GenerateReportFrame(tk.Frame):
         self.end_date.insert(0, today.strftime("%Y-%m-%d"))
 
     def _build_kpi_card(self, parent, label, var, icon_name=None):
-        """icon_name is optional."""
         card = ttk.Frame(parent, style="Card.TFrame")
         card["padding"] = (12, 10, 12, 10)
         card_inner = tk.Frame(card, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_COLOR)
@@ -692,7 +691,7 @@ class GenerateReportFrame(tk.Frame):
         self.kpi_vars["entries"].set(str(k["entries"]))
         self.kpi_vars["avg"].set(f"{k['avg_per_day']:.2f}")
         self.kpi_vars["top"].set(k["top_reason"])
-        self.kpi_vars["rate"].set(f"{k['scrap_rate']:.2f}%" if k["scrap_rate"] is not None else "—")
+        self.kpi_vars["rate"].set(f"{k['scrap_rate']:.2f}%" if k['scrap_rate'] is not None else "—")
 
         if df.empty:
             messagebox.showinfo("No Data", "No scrap logs found for the selected filters.")
@@ -703,9 +702,8 @@ class GenerateReportFrame(tk.Frame):
         if df.empty:
             return
 
-        # Only show columns that exist; others will be empty strings
         present = set(df.columns)
-        for _, r in df.iterrows():
+        for i, r in df.iterrows():
             values = [
                 str(r.get("date", "")),
                 str(r.get("shift", "")),
@@ -718,7 +716,7 @@ class GenerateReportFrame(tk.Frame):
                 str(r.get("entry_type", "")) if "entry_type" in present else "",
                 str(r.get("comments", "")),
             ]
-            tag = "even" if (_ % 2) else "odd"
+            tag = "even" if (i % 2) else "odd"
             self.tree.insert("", "end", values=values, tags=(tag,))
 
     def on_export(self):
