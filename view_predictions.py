@@ -1,3 +1,5 @@
+# view_predictions.py
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
@@ -27,16 +29,19 @@ BG_SIDEBAR = "#DBE2E9"
 BG_APP = "white"
 
 # -----------------
-# DB CONNECTION
+# DB CONNECTION (env-driven)
 # -----------------
 def get_db_connection():
-    # TODO: set your password if needed
+    """
+    Connect using environment variables (PGHOST, PGUSER, PGPASSWORD, PGDATABASE, PGPORT).
+    Falls back to local defaults if not set.
+    """
     return psycopg2.connect(
-        dbname="scrapsense",
-        user="postgres",
-        password="",
-        host="localhost",
-        port="5432"
+        host=os.getenv("PGHOST", "127.0.0.1"),
+        user=os.getenv("PGUSER", "scrapsense"),
+        password=os.getenv("PGPASSWORD", "scrapsense2006"),
+        dbname=os.getenv("PGDATABASE", "scrapsense"),
+        port=int(os.getenv("PGPORT", "5432")),
     )
 
 def fetch_logs() -> pd.DataFrame:
@@ -46,10 +51,10 @@ def fetch_logs() -> pd.DataFrame:
     """
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Figure out available columns
+            # figure out available columns
             cur.execute(
                 """SELECT column_name FROM information_schema.columns
-                   WHERE table_name='scrap_logs';"""
+                   WHERE table_schema='public' AND table_name='scrap_logs';"""
             )
             cols = {r["column_name"] for r in cur.fetchall()}
             has_machine = "machine" in cols
@@ -75,11 +80,13 @@ def fetch_logs() -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Normalize
+    # normalize
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
     df["unit"] = df["unit"].astype(str)
-    df["shift"] = df["shift"].astype(str).str.strip().str.upper().str.replace("^SHIFT\\s+", "", regex=True)
+    df["shift"] = (
+        df["shift"].astype(str).str.strip().str.upper().str.replace(r"^SHIFT\s+", "", regex=True)
+    )
     df["reason"] = df.get("reason", pd.Series(index=df.index)).astype(str).str.strip()
 
     if "machine" in df.columns:
@@ -139,7 +146,7 @@ def fit_predict_with_ci(y: np.ndarray, periods_ahead: int = 7, ci=(10, 90)):
     trend = np.poly1d(coef)(x)
     resid = y - trend
     if len(resid) < 5:
-        resid = np.pad(resid, (0, 5-len(resid)), constant_values=resid.mean())
+        resid = np.pad(resid, (0, 5 - len(resid)), constant_values=resid.mean())
 
     sims = 800
     boot_in = np.random.choice(resid, size=(sims, n), replace=True)
@@ -173,8 +180,10 @@ class PredictionsDashboardFrame(tk.Frame):
 
         # ---------- ttk Style ----------
         style = ttk.Style(self)
-        try: style.theme_use("clam")
-        except: pass
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
 
         style.configure(
             "TButton",
@@ -532,7 +541,7 @@ class PredictionsDashboardFrame(tk.Frame):
                           text=row["machine"], font=("Segoe UI", 11), fill="#0F172A")
             # Shift
             c.create_text(int(w * self.columns[2][1]), row_y, anchor="w",
-                          text=row["shift"], font=("Segoe UI", 11), fill="#0F172A")
+                          text=row["shift"]), 
             # Predicted Scrap
             c.create_text(int(w * self.columns[3][1]), row_y, anchor="w",
                           text=row["pred"], font=("Segoe UI", 11), fill="#0F172A")
@@ -549,6 +558,11 @@ class PredictionsDashboardFrame(tk.Frame):
                           text=row["cause"], font=("Segoe UI", 11), fill="#0F172A")
 
             row_y += row_height
+
+# -----------------
+# Backwards-compat alias so main.py can import either name
+# -----------------
+ViewPredictionsFrame = PredictionsDashboardFrame
 
 # -----------------
 # STANDALONE TEST
