@@ -1,530 +1,499 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from tkcalendar import Calendar
-from datetime import datetime
+# view_predictions.py — cleaned for Neon/local Postgres + Tk
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
-import psycopg2
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime, timedelta
+import numpy as np
 import pandas as pd
+import psycopg2
+import psycopg2.extras
+from psycopg2 import sql
+
+# Set backend for Tk BEFORE importing the TkAgg canvas adapter
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# -----------------
+# SETTINGS / THEME
+# -----------------
+FILTER_BG = "#DCDAD5"
+RISK_COLORS = {"High": "#EF4444", "Medium": "#F59E0B", "Low": "#22C55E"}
+BG_SIDEBAR = "#DBE2E9"
+BG_APP = "white"
+
+# -----------------
+# DB (env-driven)
+# -----------------
+from db import get_db_connection
 
 
-# =========================
-# DB CONFIG (edit if needed)
-# =========================
-# Prefer env vars so your friend can point to your Tailscale IP without editing code:
-#   PGHOST=100.112.207.122  PGUSER=scrapsense  PGPASSWORD=***  PGDATABASE=scrapsense  PGPORT=5432
-PG_HOST = os.getenv("PGHOST", "127.0.0.1")          # set to your Tailscale IP on friends' machines
-PG_DB   = os.getenv("PGDATABASE", "scrapsense")
-PG_USER = os.getenv("PGUSER", "scrapsense")         # we created this role
-PG_PASS = os.getenv("PGPASSWORD", "scrapsense2006")               # put password here if not using env var
-PG_PORT = int(os.getenv("PGPORT", "5432"))
-
-TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.scrap_logs (
-    id SERIAL PRIMARY KEY,
-    machine_operator TEXT NOT NULL,
-    date TEXT NOT NULL,                       -- keeping your MM/DD/YYYY text format
-    quantity NUMERIC NOT NULL,
-    unit TEXT NOT NULL,
-    total_produced NUMERIC,
-    shift TEXT NOT NULL,
-    reason TEXT,
-    comments TEXT
-);
--- Ensure (date, shift) is unique so different shifts on same day are allowed,
--- but duplicates of the same pair are prevented.
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND tablename  = 'scrap_logs'
-          AND indexname  = 'scrap_logs_date_shift_key'
-    ) THEN
-        BEGIN
-            ALTER TABLE public.scrap_logs
-            ADD CONSTRAINT scrap_logs_date_shift_key UNIQUE (date, shift);
-        EXCEPTION WHEN duplicate_object THEN
-            -- ignore if somehow already exists
-            NULL;
-        END;
-    END IF;
-END$$;
-"""
-
-ADD_TOTAL_PRODUCED_SQL = """
-ALTER TABLE public.scrap_logs
-ADD COLUMN IF NOT EXISTS total_produced NUMERIC;
-"""
-
-
-class AddScrapFrame(tk.Frame):
-    def __init__(self, parent, controller, image_dir="./images"):
-        super().__init__(parent, bg="#F8FAFC")
-        self.controller = controller
-        self.image_dir = image_dir
-
-        # Global caret style so insertion cursor is visible everywhere
-        self.option_add('*Entry.insertBackground', 'black')
-        self.option_add('*Text.insertBackground', 'black')
-        self.option_add('*TCombobox*insertBackground', 'black')
-
-        self.scale_x = self.winfo_screenwidth() / 1920
-        self.scale_y = self.winfo_screenheight() / 1080
-        self.scale_font = (self.scale_x + self.scale_y) / 2
-
-        self.fields = {}
-        self.shift_suggestions = []
-
-        # Make sure DB/table are ready
-        self.init_db()
-
-        self.build_interface()
-
-    # ---------------- DB helpers ----------------
-    def get_db_connection(self):
-        return psycopg2.connect(
-            dbname=PG_DB,
-            user=PG_USER,
-            password=PG_PASS,
-            host=PG_HOST,
-            port=str(PG_PORT),
-            connect_timeout=5,
-            application_name="ScrapSense_AddScrap"
+def fetch_logs() -> pd.DataFrame:
+    """
+    Pull scrap logs and normalize columns.
+    Expected base cols: date, quantity, unit, shift, reason, machine_name (or machine_operator).
+    """
+    with get_db_connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT column_name
+               FROM information_schema.columns
+               WHERE table_schema='public' AND table_name='scrap_logs';"""
         )
+        cols = {r["column_name"] for r in cur.fetchall()}
 
-    def init_db(self):
-        """Ensure table exists with UNIQUE(date, shift)."""
-        try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute(TABLE_SQL)
-                cur.execute(ADD_TOTAL_PRODUCED_SQL)
-                conn.commit()
-        except Exception as e:
-            print("DB init warning:", e)
+        sel_cols = ["date", "quantity", "unit", "shift", "reason"]
+        # prefer machine_name; fallback to machine_operator for the key
+        if "machine_name" in cols:
+            sel_cols.insert(0, "machine_name")
+        elif "machine_operator" in cols:
+            sel_cols.insert(0, "machine_operator")
 
-    def ensure_total_produced_column(self):
-        """Add total_produced column if it's missing (NUMERIC)."""
-        try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute(ADD_TOTAL_PRODUCED_SQL)
-                conn.commit()
-        except Exception as e:
-            print("Warning adding total_produced column:", e)
+        if "comments" in cols:
+            sel_cols.append("comments")
+        if "entry_type" in cols:
+            sel_cols.append("entry_type")
 
-    def fetch_shift_suggestions(self):
-        try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT shift FROM public.scrap_logs WHERE shift IS NOT NULL AND shift <> '' ORDER BY shift ASC")
-                rows = cur.fetchall()
-            self.shift_suggestions = [r[0] for r in rows if r[0]]
-        except Exception:
-            self.shift_suggestions = []
-        if "shift" in self.fields:
-            current = self.fields["shift"].get().lower()
-            if current:
-                self.fields["shift"]["values"] = [s for s in self.shift_suggestions if current in s.lower()]
-            else:
-                self.fields["shift"]["values"] = self.shift_suggestions
+        qry = sql.SQL("SELECT {} FROM public.scrap_logs").format(
+            sql.SQL(", ").join(map(sql.Identifier, sel_cols))
+        )
+        cur.execute(qry)
+        rows = cur.fetchall()
 
-    # ---------------- validation helpers ----------------
-    def validate_date(self, date_str):
-        try:
-            datetime.strptime(date_str, "%m/%d/%Y")
-            return True
-        except ValueError:
-            return False
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-    def entry_exists(self, date, shift):
-        """Return True if an entry exists for the exact (date, shift) pair."""
-        try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT 1 FROM public.scrap_logs
-                    WHERE date = %s
-                      AND UPPER(TRIM(shift)) = %s
-                    LIMIT 1
-                    """,
-                    (date, shift.upper().strip()),
-                )
-                return cur.fetchone() is not None
-        except Exception:
-            return False
+    # normalize
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df["unit"] = df["unit"].astype(str)
 
-    def overwrite_entry(self, date, shift):
-        """Delete only the row(s) for the exact (date, shift) pair."""
+    df["shift"] = (
+        df["shift"].astype(str).str.strip().str.upper().str.replace(r"^SHIFT\s+", "", regex=True)
+    )
+    df["reason"] = df.get("reason", pd.Series(index=df.index)).astype(str).str.strip()
+
+    if "machine_name" in df.columns:
+        df["machine_key"] = df["machine_name"].astype(str)
+    elif "machine_operator" in df.columns:
+        df["machine_key"] = df["machine_operator"].astype(str)
+    else:
+        df["machine_key"] = "Unknown"
+
+    df = df.dropna(subset=["date", "quantity", "unit", "shift", "machine_key"])
+    return df
+
+
+# -----------------
+# SMALL HELPERS
+# -----------------
+def apply_date_preset(df: pd.DataFrame, preset: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    today = datetime.today().date()
+    if preset == "Today":
+        return df[df["date"].dt.date == today]
+    if preset == "This Week":
+        monday = today - timedelta(days=datetime.today().weekday())
+        return df[df["date"].dt.date >= monday]
+    if preset == "This Month":
+        first = datetime(today.year, today.month, 1).date()
+        return df[df["date"].dt.date >= first]
+    if preset == "Last 30 Days":
+        return df[df["date"].dt.date >= today - timedelta(days=30)]
+    return df
+
+
+def fit_predict_with_ci(y: np.ndarray, periods_ahead: int = 7, ci=(10, 90)):
+    """
+    Simple baseline (linear trend + bootstrap residuals).
+    Always returns arrays so plots don't crash on tiny histories.
+    """
+    y = np.asarray(y, dtype=float)
+    y = y[~np.isnan(y) & ~np.isinf(y)]
+
+    if len(y) == 0:
+        empty = np.array([])
+        fut = np.zeros(periods_ahead)
+        return dict(y_pred=empty, lower=empty, upper=empty,
+                    future_pred=fut, future_lower=fut, future_upper=fut,
+                    resid=np.array([0.0]))
+
+    if len(y) == 1 or np.allclose(y, y[0]):
+        const = np.full(len(y), y.mean())
+        fut_const = np.full(periods_ahead, float(y.mean()))
+        return dict(y_pred=const, lower=const, upper=const,
+                    future_pred=fut_const, future_lower=fut_const, future_upper=fut_const,
+                    resid=np.array([0.0]))
+
+    n = len(y)
+    x = np.arange(n)
+    coef = np.polyfit(x, y, 1)
+    trend = np.poly1d(coef)(x)
+    resid = y - trend
+    if len(resid) < 5:
+        resid = np.pad(resid, (0, 5 - len(resid)), constant_values=resid.mean())
+
+    sims = 800
+    boot_in = np.random.choice(resid, size=(sims, n), replace=True)
+    sim_in = trend + boot_in
+    lower, upper = np.percentile(sim_in, ci[0], axis=0), np.percentile(sim_in, ci[1], axis=0)
+
+    xf = np.arange(n, n + periods_ahead)
+    future_trend = np.poly1d(coef)(xf)
+    boot_out = np.random.choice(resid, size=(sims, periods_ahead), replace=True)
+    sim_out = future_trend + boot_out
+    fl, fu = np.percentile(sim_out, ci[0], axis=0), np.percentile(sim_out, ci[1], axis=0)
+
+    return dict(y_pred=trend, lower=lower, upper=upper,
+                future_pred=future_trend, future_lower=fl, future_upper=fu,
+                resid=resid)
+
+
+def risk_bucket(value: float, threshold_low: float, threshold_high: float) -> str:
+    if value >= threshold_high:
+        return "High"
+    if value >= threshold_low:
+        return "Medium"
+    return "Low"
+
+
+# -----------------
+# FRAME
+# -----------------
+class PredictionsDashboardFrame(tk.Frame):
+    def __init__(self, parent, controller=None):
+        super().__init__(parent, bg=BG_APP)
+        self.controller = controller
+
+        # ---------- ttk Style ----------
+        style = ttk.Style(self)
         try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute(
-                    """
-                    DELETE FROM public.scrap_logs
-                    WHERE date = %s
-                      AND UPPER(TRIM(shift)) = %s
-                    """,
-                    (date, shift.upper().strip()),
-                )
-                conn.commit()
+            style.theme_use("clam")
         except Exception:
             pass
 
-    # ---------------- UI builders ----------------
-    def build_interface(self):
-        self.time_label = tk.Label(self, font=("Segoe UI", int(14*self.scale_font)),
-                                   bg="#F8FAFC", fg="#475569")
-        self.time_label.place(relx=0.98, y=int(42*self.scale_y), anchor="ne")
-        self.update_time()
+        style.configure("TButton", padding=6, relief="flat",
+                        background="#0078D7", foreground="white",
+                        font=("Segoe UI", 10, "bold"))
+        style.map("TButton", background=[("active", "#005A9E")])
 
-        tk.Label(self, text="Add Scrap",
-                 font=("Segoe UI", int(44*self.scale_font), "bold"),
-                 bg="#F8FAFC", fg="#0F172A").pack(
-            pady=(int(80*self.scale_y), int(28*self.scale_y)))
+        style.configure("Custom.TCombobox",
+                        fieldbackground=FILTER_BG,
+                        background=FILTER_BG,
+                        selectbackground=FILTER_BG,
+                        selectforeground="black")
 
-        form_frame = tk.Frame(self, bg="white",
-                              padx=int(40*self.scale_x), pady=int(40*self.scale_y),
-                              highlightbackground="#E2E8F0", highlightthickness=1)
-        form_frame.pack()
+        # ---------- Data ----------
+        self.df_raw = fetch_logs()
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TCombobox",
-                        fieldbackground="white", background="white",
-                        foreground="black", padding=int(5*self.scale_y))
+        # Defaults (tune as needed)
+        self.horizon_days = 7
+        self.threshold_low = 2500
+        self.threshold_high = 4000
 
-        # Entry Type
-        self._create_label(form_frame, "Entry Type:", 0)
-        entry_type = ttk.Combobox(form_frame,
-                                  values=["Manual Entry", "Import Document"], width=47,
-                                  font=("Segoe UI", int(12*self.scale_font)),
-                                  state="normal")
-        self.enable_focus(entry_type)
-        entry_type.set("Select Entry Type")
-        entry_type.grid(row=0, column=1, sticky="w", pady=int(10*self.scale_y))
-        entry_type.bind("<<ComboboxSelected>>", self.handle_entry_type_change)
-        self.fields["entry_type"] = entry_type
+        # ---------- Layout ----------
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(1, weight=1)
 
-        # Machine Operator
-        self._create_label(form_frame, "Machine Operator (ID):", 1)
-        mop_entry = tk.Entry(form_frame, width=50,
-                             font=("Segoe UI", int(12*self.scale_font)),
-                             fg="black", bg="#F9FAFB", relief="flat",
-                             highlightthickness=2,
-                             highlightbackground="#E2E8F0",
-                             highlightcolor="#2563EB",
-                             insertbackground="black")
-        self.enable_focus(mop_entry)
-        mop_entry.grid(row=1, column=1, sticky="w", pady=int(10*self.scale_y), ipady=int(5*self.scale_y))
-        self.fields["machine_operator"] = mop_entry
+        self._build_sidebar()
+        self._build_top_controls()
+        self._build_split_charts()
+        self._build_bottom_table()
 
-        # Date
-        self._create_label(form_frame, "Date (MM/DD/YYYY):", 2)
-        date_frame = tk.Frame(form_frame, bg="white")
-        date_frame.grid(row=2, column=1, sticky="w", pady=int(10*self.scale_y))
-        date_entry = tk.Entry(date_frame, width=47,
-                              font=("Segoe UI", int(12*self.scale_font)),
-                              fg="black", bg="#F9FAFB", relief="flat",
-                              highlightthickness=2,
-                              highlightbackground="#E2E8F0",
-                              highlightcolor="#2563EB",
-                              insertbackground="black")
-        self.enable_focus(date_entry)
-        date_entry.insert(0, datetime.now().strftime("%m/%d/%Y"))
-        date_entry.pack(side="left", ipady=int(5*self.scale_y))
-        self.fields["date"] = date_entry
+        self.apply_filters()
 
-        calendar_icon_path = os.path.join(self.image_dir, "schedule.png")
-        if os.path.isfile(calendar_icon_path):
-            from PIL import Image, ImageTk
-            img = Image.open(calendar_icon_path).convert("RGBA")
-            img = img.resize((20, 20))
-            self.calendar_img = ImageTk.PhotoImage(img)
-            cal_btn = tk.Button(date_frame, image=self.calendar_img, command=self.open_calendar,
-                                bg="white", bd=0, cursor="hand2")
+    # Sidebar / Controls / Charts / Table builders unchanged ----------------
+    def _build_sidebar(self):
+        self.sidebar = tk.Frame(self, bg=BG_SIDEBAR, padx=10, pady=10)
+        self.sidebar.grid(row=0, column=0, rowspan=3, sticky="ns")
+        self.sidebar.columnconfigure(0, weight=1)
+
+        tk.Label(self.sidebar, text="Filters", font=("Segoe UI", 12, "bold"), bg=BG_SIDEBAR).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(self.sidebar, text="Machine:", bg=BG_SIDEBAR).pack(anchor="w")
+        machines = ["All"]
+        if not self.df_raw.empty:
+            machines += sorted(self.df_raw["machine_key"].dropna().unique().tolist())
+        self.machine_cb = ttk.Combobox(self.sidebar, values=machines, state="readonly", style="Custom.TCombobox")
+        self.machine_cb.current(0)
+        self.machine_cb.pack(fill="x", pady=5)
+
+        tk.Label(self.sidebar, text="Date:", bg=BG_SIDEBAR).pack(anchor="w", pady=(10, 0))
+        self.date_cb = ttk.Combobox(self.sidebar, values=["Today", "This Week", "This Month", "Last 30 Days"],
+                                    state="readonly", style="Custom.TCombobox")
+        self.date_cb.current(3)
+        self.date_cb.pack(fill="x", pady=5)
+
+        tk.Label(self.sidebar, text="Shift:", bg=BG_SIDEBAR).pack(anchor="w", pady=(10, 0))
+        shifts = ["All"]
+        if not self.df_raw.empty:
+            shifts += sorted(self.df_raw["shift"].dropna().unique().tolist())
+        self.shift_cb = ttk.Combobox(self.sidebar, values=shifts, state="readonly", style="Custom.TCombobox")
+        self.shift_cb.current(0)
+        self.shift_cb.pack(fill="x", pady=5)
+
+        ttk.Button(self.sidebar, text="Apply Filters", command=self.apply_filters).pack(fill="x", pady=(20, 0))
+        ttk.Button(self.sidebar, text="Reload from DB", command=self._reload_from_db).pack(fill="x", pady=(8, 0))
+
+    def _build_top_controls(self):
+        self.top_controls = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
+        self.top_controls.grid(row=0, column=1, sticky="ew")
+        self.top_controls.columnconfigure(0, weight=1)
+
+        tk.Label(self.top_controls, text="Scrap Predictions", font=("Segoe UI", 14, "bold"), bg=BG_APP).pack(side="left")
+        ttk.Button(self.top_controls, text="Export Data", command=self._export_dummy).pack(side="right", padx=5)
+        ttk.Button(self.top_controls, text="Refresh", command=self.apply_filters).pack(side="right", padx=5)
+
+    def _build_split_charts(self):
+        self.chart_split = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
+        self.chart_split.grid(row=1, column=1, sticky="nsew")
+        self.chart_split.rowconfigure(0, weight=1)
+        self.chart_split.columnconfigure(0, weight=1)
+        self.chart_split.columnconfigure(2, weight=1)
+        self.canvas_line = None
+        self.canvas_pie = None
+
+    def _build_bottom_table(self):
+        self.bottom_frame = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
+        self.bottom_frame.grid(row=2, column=1, sticky="nsew")
+        self.bottom_frame.rowconfigure(1, weight=1)
+        self.bottom_frame.columnconfigure(0, weight=1)
+
+        self.title_lbl = tk.Label(self.bottom_frame, text="High-Risk Forecast & Predicted Top Cause",
+                                  font=("Segoe UI", 16, "bold"), bg=BG_APP, fg="#0F172A")
+        self.title_lbl.grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self.table_canvas = tk.Canvas(self.bottom_frame, bg=BG_APP, highlightthickness=0)
+        self.table_canvas.grid(row=1, column=0, sticky="nsew")
+        self.table_canvas.bind("<Configure>", self._draw_bottom_table)
+
+        self.columns = [
+            ("Rank", 0.03),
+            ("Machine", 0.16),
+            ("Shift", 0.31),
+            ("Predicted Scrap", 0.46),
+            ("Risk Level", 0.66),
+            ("Predicted Top Cause", 0.80),
+        ]
+        self.rows_data = []
+
+    # Actions ---------------------------------------------------------------
+    def _reload_from_db(self):
+        try:
+            self.df_raw = fetch_logs()
+            machines = ["All"] + (sorted(self.df_raw["machine_key"].unique().tolist()) if not self.df_raw.empty else [])
+            self.machine_cb["values"] = machines
+            self.machine_cb.current(0)
+
+            shifts = ["All"] + (sorted(self.df_raw["shift"].dropna().unique().tolist()) if not self.df_raw.empty else [])
+            self.shift_cb["values"] = shifts
+            self.shift_cb.current(0)
+
+            self.apply_filters()
+        except Exception as e:
+            messagebox.showerror("Reload Error", str(e))
+
+    def _export_dummy(self):
+        messagebox.showinfo("Export", "Hook your export logic here (CSV/XLSX).")
+
+    def apply_filters(self):
+        if self.df_raw.empty:
+            self._render_empty(); return
+
+        df = self.df_raw.copy()
+
+        m_sel = self.machine_cb.get()
+        if m_sel and m_sel != "All":
+            df = df[df["machine_key"] == m_sel]
+
+        df = apply_date_preset(df, self.date_cb.get())
+
+        s_sel = self.shift_cb.get()
+        if s_sel and s_sel != "All":
+            df = df[df["shift"] == s_sel]
+
+        if df.empty:
+            self._render_empty(); return
+
+        day = df.groupby("date", as_index=False)["quantity"].sum().sort_values("date")
+        y = day["quantity"].to_numpy(dtype=float)
+        model = fit_predict_with_ci(y, periods_ahead=self.horizon_days)
+        dates = day["date"].to_numpy()
+        fut_dates = pd.date_range(start=pd.to_datetime(dates[-1]) + timedelta(days=1),
+                                  periods=self.horizon_days, freq="D")
+
+        cause_df = df.assign(reason=df["reason"].replace({"": np.nan})).dropna(subset=["reason"])
+        cause_agg = (cause_df.groupby("reason", as_index=False)["quantity"].sum()
+                     .sort_values("quantity", ascending=False))
+
+        self.rows_data = self._build_risk_rows(df)
+
+        unit = df["unit"].mode().iat[0] if not df["unit"].empty else ""
+        self._render_line_chart(dates, y, model, fut_dates, unit=unit)
+        self._render_pie_chart(cause_agg)
+        self._draw_bottom_table()
+
+    # Renderers -------------------------------------------------------------
+    def _render_empty(self):
+        for child in self.chart_split.winfo_children():
+            child.destroy()
+        tk.Label(self.chart_split, text="No data for the selected filters.", bg=BG_APP,
+                 font=("Segoe UI", 12)).grid(row=0, column=0, sticky="nsew")
+        self.rows_data = []
+        self._draw_bottom_table()
+
+    def _render_line_chart(self, dates, y, model, fut_dates, unit=""):
+        for child in self.chart_split.grid_slaves(row=0, column=0):
+            child.destroy()
+
+        fig_line = Figure(figsize=(6, 3), dpi=100)
+        ax1 = fig_line.add_subplot(111)
+
+        if len(y) == 1:
+            ax1.scatter(dates, y, label="Actual", color="#0078D7")
         else:
-            cal_btn = tk.Button(date_frame, text="📅", command=self.open_calendar, bg="white", bd=0, cursor="hand2")
-        cal_btn.pack(side="left", padx=5)
-        self.cal_btn = cal_btn
+            ax1.plot(dates, y, "o--", label="Actual", color="#0078D7", linewidth=1.2)
 
-        # ---------- Total Produced FIRST ----------
-        self._create_label(form_frame, "Total Produced:", 3)
-        prod_frame = tk.Frame(form_frame, bg="white")
-        prod_frame.grid(row=3, column=1, sticky="w", pady=int(10*self.scale_y))
-        total_prod_entry = tk.Entry(prod_frame, width=30,
-                                    font=("Segoe UI", int(12*self.scale_font)),
-                                    fg="black", bg="#F9FAFB", relief="flat",
-                                    highlightthickness=2,
-                                    highlightbackground="#E2E8F0",
-                                    highlightcolor="#2563EB",
-                                    insertbackground="black")
-        self.enable_focus(total_prod_entry)
-        total_prod_entry.pack(side="left", ipady=int(5*self.scale_y))
-        produced_unit = ttk.Combobox(prod_frame, values=["lb", "kg", "units", "grams"], width=7,
-                                     font=("Segoe UI", int(12*self.scale_font)), state="readonly")
-        self.enable_focus(produced_unit)
-        produced_unit.set("Select")
-        produced_unit.pack(side="left", padx=int(12*self.scale_x))
-        self.fields["total_produced"] = total_prod_entry
-        self.fields["produced_unit"] = produced_unit
+        if len(model["y_pred"]) == len(dates) and len(model["y_pred"]):
+            ax1.plot(dates, model["y_pred"], "-", label="Predicted", color="#1F8EFA", linewidth=2)
+            if len(model["lower"]) == len(dates):
+                ax1.fill_between(dates, model["lower"], model["upper"], alpha=0.2, color="#1F8EFA", label="Confidence")
 
-        # ---------- Scrap Quantity SECOND ----------
-        self._create_label(form_frame, "Scrap Quantity:", 4)
-        qty_frame = tk.Frame(form_frame, bg="white")
-        qty_frame.grid(row=4, column=1, sticky="w", pady=int(10*self.scale_y))
-        quantity_entry = tk.Entry(qty_frame, width=30,
-                                  font=("Segoe UI", int(12*self.scale_font)),
-                                  fg="black", bg="#F9FAFB", relief="flat",
-                                  highlightthickness=2,
-                                  highlightbackground="#E2E8F0",
-                                  highlightcolor="#2563EB",
-                                  insertbackground="black")
-        self.enable_focus(quantity_entry)
-        quantity_entry.pack(side="left", ipady=int(5*self.scale_y))
-        unit_dropdown = ttk.Combobox(qty_frame, values=["lb", "kg", "units", "grams"], width=7,
-                                     font=("Segoe UI", int(12*self.scale_font)), state="readonly")
-        self.enable_focus(unit_dropdown)
-        unit_dropdown.set("Select")
-        unit_dropdown.pack(side="left", padx=int(12*self.scale_x))
-        self.fields["quantity"] = quantity_entry
-        self.fields["unit"] = unit_dropdown
+        if len(fut_dates) and len(model["future_pred"]):
+            ax1.plot(fut_dates, model["future_pred"], ":", color="#1F8EFA", linewidth=2, label="Forecast")
+            if len(model["future_lower"]):
+                ax1.fill_between(fut_dates, model["future_lower"], model["future_upper"], alpha=0.15, color="#1F8EFA")
 
-        # Force matching units: produced unit drives scrap unit
-        def on_produced_unit_change(event=None):
-            sel = produced_unit.get()
-            if sel and sel != "Select":
-                self.fields["unit"].set(sel)
-        produced_unit.bind("<<ComboboxSelected>>", on_produced_unit_change)
+        ax1.set_title(f"Predicted Scrap Volume ({unit})", fontsize=11)
+        ax1.set_xlabel("Date")
+        ax1.set_ylabel(f"Scrap ({unit})")
+        ax1.grid(True, linestyle="--", alpha=0.35)
+        ax1.legend()
 
-        # Shift
-        self._create_label(form_frame, "Shift:", 5)
-        self.fetch_shift_suggestions()
-        shift_var = tk.StringVar()
-        shift_entry = ttk.Combobox(form_frame, textvariable=shift_var,
-                                   values=self.shift_suggestions,
-                                   width=47, font=("Segoe UI", int(12*self.scale_font)),
-                                   state="normal")
-        self.enable_focus(shift_entry)
-        shift_entry.set("Type or Select Shift")
-        shift_entry.grid(row=5, column=1, sticky="w", pady=int(10*self.scale_y))
-        self.fields["shift"] = shift_entry
+        self.canvas_line = FigureCanvasTkAgg(fig_line, master=self.chart_split)
+        self.canvas_line.draw()
+        self.canvas_line.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
-        # Reason
-        self._create_label(form_frame, "Reason:", 6)
-        reason_entry = tk.Entry(form_frame, width=50,
-                                font=("Segoe UI", int(12*self.scale_font)),
-                                fg="black", bg="#F9FAFB", relief="flat",
-                                highlightthickness=2,
-                                highlightbackground="#E2E8F0",
-                                highlightcolor="#2563EB",
-                                insertbackground="black")
-        self.enable_focus(reason_entry)
-        reason_entry.grid(row=6, column=1, sticky="w", pady=int(10*self.scale_y), ipady=int(5*self.scale_y))
-        self.fields["reason"] = reason_entry
+        sep = tk.Frame(self.chart_split, bg="#B0B0B0", width=2)
+        sep.grid(row=0, column=1, sticky="ns", padx=2)
 
-        # Comments
-        self._create_label(form_frame, "Additional Comments:", 7)
-        comments_text = tk.Text(form_frame, width=50, height=5,
-                                font=("Segoe UI", int(12*self.scale_font)),
-                                fg="black", bg="#F9FAFB", relief="flat",
-                                highlightthickness=2,
-                                highlightbackground="#E2E8F0",
-                                highlightcolor="#2563EB",
-                                insertbackground="black")
-        self.enable_focus(comments_text)
-        comments_text.grid(row=7, column=1, sticky="w", pady=int(10*self.scale_y))
-        self.fields["comments"] = comments_text
+    def _render_pie_chart(self, cause_agg: pd.DataFrame):
+        for child in self.chart_split.grid_slaves(row=0, column=2):
+            child.destroy()
 
-        # Submit Button
-        style.configure("Green.TButton",
-                        background="#22C55E", foreground="white",
-                        font=("Segoe UI", int(16 * self.scale_font), "bold"),
-                        padding=int(10 * self.scale_y))
-        style.map("Green.TButton", background=[("active", "#16A34A")])
-        ttk.Button(self, text="Submit Scrap Entry", style="Green.TButton",
-                   cursor="hand2", command=self.submit_scrap_entry).pack(
-            pady=int(30 * self.scale_y), ipady=int(5 * self.scale_y))
+        fig_pie = Figure(figsize=(5, 3), dpi=100)
+        ax2 = fig_pie.add_subplot(111)
 
-    def _create_label(self, parent, text, row):
-        tk.Label(parent, text=text, font=("Segoe UI", int(14*self.scale_font), "bold"),
-                 bg="white", fg="#334155", anchor="w").grid(
-            row=row, column=0, sticky="w", pady=int(10*self.scale_y), padx=int(10*self.scale_x))
+        if cause_agg.empty:
+            ax2.axis("off")
+            ax2.text(0.5, 0.5, "No scrap causes available\nin the selected window.",
+                     ha="center", va="center", fontsize=11)
+        else:
+            total = cause_agg["quantity"].sum()
+            cause_agg["share"] = cause_agg["quantity"] / total
+            main = cause_agg[cause_agg["share"] >= 0.05]
+            other_sum = cause_agg[cause_agg["share"] < 0.05]["quantity"].sum()
+            if other_sum > 0:
+                main = pd.concat([main, pd.DataFrame([{"reason": "Other", "quantity": other_sum, "share": other_sum/total}])])
+            ax2.pie(main["quantity"], labels=main["reason"], autopct="%1.0f%%", startangle=140, textprops={'fontsize': 9})
+            ax2.set_title("Scrap Source Breakdown", fontsize=11)
 
-    def enable_focus(self, widget):
-        widget.bind("<Button-1>", lambda e: e.widget.focus_set())
+        self.canvas_pie = FigureCanvasTkAgg(fig_pie, master=self.chart_split)
+        self.canvas_pie.draw()
+        self.canvas_pie.get_tk_widget().grid(row=0, column=2, sticky="nsew", padx=(5, 0))
 
-    def update_time(self):
-        now = datetime.now()
-        self.time_label.config(text=now.strftime("%A, %B %d, %Y  %I:%M:%S %p"))
-        self.after(1000, self.update_time)
+    # High-risk table -------------------------------------------------------
+    def _build_risk_rows(self, df: pd.DataFrame):
+        last_date = df["date"].max()
+        per_ms = (df[df["date"] == last_date]
+                  .groupby(["machine_key", "shift"], as_index=False)["quantity"].sum()
+                  .rename(columns={"quantity": "pred"}))
 
-    # ---------------- Calendar ----------------
-    def open_calendar(self):
-        top = tk.Toplevel(self)
-        top.title("Select Date")
-        cal = Calendar(top, selectmode="day", year=datetime.now().year,
-                       month=datetime.now().month, day=datetime.now().day)
-        cal.pack(pady=20)
+        recent = df[df["date"] >= last_date - timedelta(days=14)]
+        cause = (recent.groupby(["machine_key", "shift", "reason"], as_index=False)["quantity"].sum()
+                 .sort_values(["machine_key", "shift", "quantity"], ascending=[True, True, False]))
+        top_cause = cause.groupby(["machine_key", "shift"]).first().reset_index()
 
-        def pick_date():
-            self.fields["date"].delete(0, tk.END)
-            self.fields["date"].insert(0, cal.get_date())
-            top.destroy()
+        out = per_ms.merge(top_cause[["machine_key", "shift", "reason"]], on=["machine_key", "shift"], how="left")
+        out["risk"] = out["pred"].apply(lambda v: risk_bucket(v, self.threshold_low, self.threshold_high))
+        out = out.sort_values("pred", ascending=False).reset_index(drop=True)
 
-        ttk.Button(top, text="Select", command=pick_date).pack(pady=10)
+        rows = []
+        for i, r in out.iterrows():
+            rows.append({
+                "rank": i + 1,
+                "machine": r["machine_key"],
+                "shift": r["shift"],
+                "pred": f"{int(r['pred']):,} kg",
+                "risk": r["risk"],
+                "cause": r["reason"] if pd.notna(r["reason"]) and str(r["reason"]).strip() else "—",
+            })
+        if not rows:
+            rows = [{"rank": 1, "machine": "—", "shift": "—", "pred": "0 kg", "risk": "Low", "cause": "—"}]
+        return rows[:10]
 
-    # ---------------- Event handlers ----------------
-    def handle_entry_type_change(self, event):
-        if self.fields["entry_type"].get() == "Import Document":
-            self.import_document()
+    def _rounded_rect(self, canvas, x1, y1, x2, y2, r=8, fill="#cccccc", outline=""):
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90, fill=fill, outline=outline)
+        canvas.create_arc(x2 - 2*r, y1, x2, y1 + 2*r, start=0, extent=90, fill=fill, outline=outline)
+        canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90, fill=fill, outline=outline)
+        canvas.create_arc(x2 - 2*r, y2 - 2*r, x2, y2, start=270, extent=90, fill=fill, outline=outline)
+        canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=outline)
+        canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline)
 
-    def submit_scrap_entry(self):
-        # Force matching units: produced unit drives scrap unit
-        produced_unit = self.fields["produced_unit"].get().strip()
-        if produced_unit and produced_unit != "Select":
-            self.fields["unit"].set(produced_unit)
+    def _draw_bottom_table(self, event=None):
+        c = self.table_canvas
+        c.delete("all")
+        w = c.winfo_width() or 900
+        pad_x = 10
+        start_x = pad_x
+        top = 8
 
-        machine_operator = self.fields["machine_operator"].get().strip()
-        date = self.fields["date"].get().strip()
-        quantity = self.fields["quantity"].get().strip()
-        unit = self.fields["unit"].get().strip()
-        total_produced = self.fields["total_produced"].get().strip()
-        shift = self.fields["shift"].get().strip()
-        reason = self.fields["reason"].get().strip()
-        comments = self.fields["comments"].get("1.0", tk.END).strip()
+        header_y = top + 6
+        for text, relx in self.columns:
+            x = int(w * relx)
+            c.create_text(x, header_y, text=text, anchor="w",
+                          font=("Segoe UI", 10, "bold"), fill="#475569")
 
-        if (not machine_operator or not date or not quantity or not total_produced
-            or not shift or "Select" in shift or not unit or unit == "Select"
-            or not produced_unit or produced_unit == "Select"):
-            messagebox.showerror("Validation Error", "Please fill in all required fields and select units.")
-            return
+        row_height = 34
+        row_y = header_y + 24
+        for row in self.rows_data:
+            c.create_text(int(w * self.columns[0][1]), row_y, anchor="w",
+                          text=str(row["rank"]), font=("Segoe UI", 11), fill="#0F172A")
+            c.create_text(int(w * self.columns[1][1]), row_y, anchor="w",
+                          text=row["machine"], font=("Segoe UI", 11), fill="#0F172A")
+            c.create_text(int(w * self.columns[2][1]), row_y, anchor="w",
+                          text=row["shift"])
+            c.create_text(int(w * self.columns[3][1]), row_y, anchor="w",
+                          text=row["pred"], font=("Segoe UI", 11), fill="#0F172A")
 
-        if unit != produced_unit:
-            messagebox.showerror("Validation Error", "Scrap unit and Produced unit must match.")
-            return
+            pill_w, pill_h = 70, 22
+            rx = int(w * self.columns[4][1]); ry = row_y - pill_h // 2
+            color = RISK_COLORS.get(row["risk"], "#6B7280")
+            self._rounded_rect(c, rx, ry, rx + pill_w, ry + pill_h, r=8, fill=color, outline="")
+            c.create_text(rx + pill_w/2, ry + pill_h/2, text=row["risk"],
+                          fill="white", font=("Segoe UI", 10, "bold"))
 
-        if not self.validate_date(date):
-            messagebox.showerror("Validation Error", "Date must be in MM/DD/YYYY format.")
-            return
+            c.create_text(int(w * self.columns[5][1]), row_y, anchor="w",
+                          text=row["cause"], font=("Segoe UI", 11), fill="#0F172A")
 
-        try:
-            quantity_num = float(quantity)
-            if quantity_num <= 0: raise ValueError
-        except ValueError:
-            messagebox.showerror("Validation Error", "Scrap Quantity must be a positive number.")
-            return
+            row_y += row_height
 
-        try:
-            total_prod_num = float(total_produced)
-            if total_prod_num <= 0: raise ValueError
-        except ValueError:
-            messagebox.showerror("Validation Error", "Total Produced must be a positive number.")
-            return
 
-        shift_normalized = shift.upper().strip()
+# Back-compat alias
+ViewPredictionsFrame = PredictionsDashboardFrame
 
-        self.ensure_total_produced_column()
 
-        # duplicate check now uses (date, shift)
-        if self.entry_exists(date, shift_normalized):
-            if not messagebox.askyesno(
-                "Duplicate Entry",
-                f"There is already an entry for {date} (Shift: {shift_normalized}).\n"
-                "Do you wish to overwrite it?"
-            ):
-                return
-            self.overwrite_entry(date, shift_normalized)
-
-        try:
-            with self.get_db_connection() as conn, conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.scrap_logs
-                    (machine_operator, date, quantity, unit, total_produced, shift, reason, comments)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (machine_operator, date, quantity_num, unit, total_prod_num,
-                      shift_normalized, reason, comments))
-                conn.commit()
-            messagebox.showinfo("Success", "Scrap entry saved successfully!")
-            self.fetch_shift_suggestions()
-        except psycopg2.errors.UniqueViolation:
-            # Safety net if someone else inserted same (date, shift) concurrently
-            messagebox.showerror("Duplicate", f"An entry for {date} / {shift_normalized} already exists.")
-        except Exception as e:
-            messagebox.showerror("Database Error", f"An error occurred: {e}")
-
-    def import_document(self):
-        file_path = filedialog.askopenfilename(title="Select Document",
-                                               filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx *.xls")])
-        if not file_path:
-            return
-        self.ensure_total_produced_column()
-        try:
-            df = pd.read_csv(file_path) if file_path.endswith(".csv") else pd.read_excel(file_path)
-            if df.empty:
-                messagebox.showwarning("Empty File", "The selected file has no data.")
-                return
-
-            cols = {c.lower().strip(): c for c in df.columns}
-
-            def get(row, keys, default=""):
-                for k in keys:
-                    if k in cols:
-                        return row[cols[k]]
-                return default
-
-            inserted, overwritten = 0, 0
-            for _, row in df.iterrows():
-                mop = str(get(row, ["machine operator id", "machine_operator", "operator"], "")).strip()
-                date = str(get(row, ["date"], datetime.now().strftime("%m/%d/%Y"))).strip()
-                qty = str(get(row, ["quantity", "scrap quantity"], "")).strip()
-                unit = str(get(row, ["unit"], "lb")).strip()
-                shift = str(get(row, ["shift"], "")).strip().upper()
-                reason = str(get(row, ["reason"], "")).strip()
-                comments = str(get(row, ["comments"], "")).strip()
-                total_prod = str(get(row, ["total produced", "total_produced", "produced"], "")).strip()
-                prod_unit = str(get(row, ["produced unit", "produced_unit"], unit)).strip()
-
-                # Force units to match
-                if not unit or unit == "Select":
-                    unit = prod_unit or "lb"
-                if not prod_unit or prod_unit == "Select":
-                    prod_unit = unit
-                if unit != prod_unit:
-                    continue
-
-                if not mop or not date or not qty or not shift or shift == "Select Shift" or not unit:
-                    continue
-                try:
-                    qty_num = float(qty)
-                    total_prod_num = float(total_prod) if total_prod else None
-                    if qty_num <= 0:
-                        continue
-                    if total_prod_num is not None and total_prod_num <= 0:
-                        continue
-                except ValueError:
-                    continue
-
-                # duplicate check uses (date, shift)
-                if self.entry_exists(date, shift):
-                    if not messagebox.askyesno(
-                        "Duplicate Entry",
-                        f"There is already an entry for {date} (Shift: {shift}). Overwrite it?"
-                    ):
-                        continue
-                    self.overwrite_entry(date, shift)
-                    overwritten += 1
-
-                try:
-                    with self.get_db_connection() as conn, conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO public.scrap_logs
-                            (machine_operator, date, quantity, unit, total_produced, shift, reason, comments)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (mop, date, qty_num, unit, total_prod_num, shift, reason, comments))
-                        conn.commit()
-                    inserted += 1
-                except Exception:
-                    continue
-
-            self.fetch_shift_suggestions()
-            messagebox.showinfo("Import Result",
-                                f"Imported {inserted} records successfully.\nOverwritten: {overwritten} records.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Import failed: {e}")
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.title("Scrap Predictions Dashboard")
+    root.geometry("1200x700")
+    root.configure(bg=BG_APP)
+    frame = PredictionsDashboardFrame(root)
+    frame.pack(fill="both", expand=True)
+    root.mainloop()
