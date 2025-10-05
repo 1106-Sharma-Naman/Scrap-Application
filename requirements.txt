@@ -1,0 +1,6 @@
+pillow
+pandas
+tkcalendar
+matplotlib
+numpy
+reportlab
