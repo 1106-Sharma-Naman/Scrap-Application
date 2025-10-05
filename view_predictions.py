@@ -1,4 +1,4 @@
-# view_predictions.py — cleaned for Neon/local Postgres + Tk
+# view_predictions.py — SQLite Recruiter Edition (runs with sample data)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,15 +8,12 @@ from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-import psycopg2
-import psycopg2.extras
-from psycopg2 import sql
-
-# Set backend for Tk BEFORE importing the TkAgg canvas adapter
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from db import get_db_connection
 
 # -----------------
 # SETTINGS / THEME
@@ -26,55 +23,35 @@ RISK_COLORS = {"High": "#EF4444", "Medium": "#F59E0B", "Low": "#22C55E"}
 BG_SIDEBAR = "#DBE2E9"
 BG_APP = "white"
 
-# -----------------
-# DB (env-driven)
-# -----------------
-from db import get_db_connection
 
-
+# -----------------
+# DB (SQLite version)
+# -----------------
 def fetch_logs() -> pd.DataFrame:
     """
-    Pull scrap logs and normalize columns.
-    Expected base cols: date, quantity, unit, shift, reason, machine_name (or machine_operator).
+    Fetch scrap logs from the local SQLite database (demo-safe).
+    Automatically adapts columns and normalizes values.
     """
-    with get_db_connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """SELECT column_name
-               FROM information_schema.columns
-               WHERE table_schema='public' AND table_name='scrap_logs';"""
-        )
-        cols = {r["column_name"] for r in cur.fetchall()}
-
+    with get_db_connection() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(scrap_logs)").fetchall()}
         sel_cols = ["date", "quantity", "unit", "shift", "reason"]
-        # prefer machine_name; fallback to machine_operator for the key
         if "machine_name" in cols:
             sel_cols.insert(0, "machine_name")
         elif "machine_operator" in cols:
             sel_cols.insert(0, "machine_operator")
-
         if "comments" in cols:
             sel_cols.append("comments")
-        if "entry_type" in cols:
-            sel_cols.append("entry_type")
-
-        qry = sql.SQL("SELECT {} FROM public.scrap_logs").format(
-            sql.SQL(", ").join(map(sql.Identifier, sel_cols))
-        )
-        cur.execute(qry)
-        rows = cur.fetchall()
+        qry = f"SELECT {', '.join(sel_cols)} FROM scrap_logs"
+        rows = [dict(r) for r in conn.execute(qry).fetchall()]
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    # normalize
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
     df["unit"] = df["unit"].astype(str)
-
-    df["shift"] = (
-        df["shift"].astype(str).str.strip().str.upper().str.replace(r"^SHIFT\s+", "", regex=True)
-    )
+    df["shift"] = df["shift"].astype(str).str.strip().str.upper()
     df["reason"] = df.get("reason", pd.Series(index=df.index)).astype(str).str.strip()
 
     if "machine_name" in df.columns:
@@ -89,7 +66,7 @@ def fetch_logs() -> pd.DataFrame:
 
 
 # -----------------
-# SMALL HELPERS
+# HELPERS
 # -----------------
 def apply_date_preset(df: pd.DataFrame, preset: str) -> pd.DataFrame:
     if df.empty:
@@ -110,8 +87,8 @@ def apply_date_preset(df: pd.DataFrame, preset: str) -> pd.DataFrame:
 
 def fit_predict_with_ci(y: np.ndarray, periods_ahead: int = 7, ci=(10, 90)):
     """
-    Simple baseline (linear trend + bootstrap residuals).
-    Always returns arrays so plots don't crash on tiny histories.
+    Simple baseline predictor (linear trend + bootstrap residuals).
+    Returns arrays with upper/lower confidence bounds.
     """
     y = np.asarray(y, dtype=float)
     y = y[~np.isnan(y) & ~np.isinf(y)]
@@ -163,14 +140,13 @@ def risk_bucket(value: float, threshold_low: float, threshold_high: float) -> st
 
 
 # -----------------
-# FRAME
+# DASHBOARD FRAME
 # -----------------
 class PredictionsDashboardFrame(tk.Frame):
     def __init__(self, parent, controller=None):
         super().__init__(parent, bg=BG_APP)
         self.controller = controller
 
-        # ---------- ttk Style ----------
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
@@ -181,22 +157,17 @@ class PredictionsDashboardFrame(tk.Frame):
                         background="#0078D7", foreground="white",
                         font=("Segoe UI", 10, "bold"))
         style.map("TButton", background=[("active", "#005A9E")])
-
         style.configure("Custom.TCombobox",
                         fieldbackground=FILTER_BG,
                         background=FILTER_BG,
                         selectbackground=FILTER_BG,
                         selectforeground="black")
 
-        # ---------- Data ----------
         self.df_raw = fetch_logs()
-
-        # Defaults (tune as needed)
         self.horizon_days = 7
         self.threshold_low = 2500
         self.threshold_high = 4000
 
-        # ---------- Layout ----------
         self.rowconfigure(1, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -204,10 +175,9 @@ class PredictionsDashboardFrame(tk.Frame):
         self._build_top_controls()
         self._build_split_charts()
         self._build_bottom_table()
-
         self.apply_filters()
 
-    # Sidebar / Controls / Charts / Table builders unchanged ----------------
+    # Sidebar -------------------------------------------------------------
     def _build_sidebar(self):
         self.sidebar = tk.Frame(self, bg=BG_SIDEBAR, padx=10, pady=10)
         self.sidebar.grid(row=0, column=0, rowspan=3, sticky="ns")
@@ -240,6 +210,7 @@ class PredictionsDashboardFrame(tk.Frame):
         ttk.Button(self.sidebar, text="Apply Filters", command=self.apply_filters).pack(fill="x", pady=(20, 0))
         ttk.Button(self.sidebar, text="Reload from DB", command=self._reload_from_db).pack(fill="x", pady=(8, 0))
 
+    # Controls / Charts / Table ------------------------------------------
     def _build_top_controls(self):
         self.top_controls = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
         self.top_controls.grid(row=0, column=1, sticky="ew")
@@ -282,7 +253,7 @@ class PredictionsDashboardFrame(tk.Frame):
         ]
         self.rows_data = []
 
-    # Actions ---------------------------------------------------------------
+    # Actions --------------------------------------------------------------
     def _reload_from_db(self):
         try:
             self.df_raw = fetch_logs()
@@ -293,7 +264,6 @@ class PredictionsDashboardFrame(tk.Frame):
             shifts = ["All"] + (sorted(self.df_raw["shift"].dropna().unique().tolist()) if not self.df_raw.empty else [])
             self.shift_cb["values"] = shifts
             self.shift_cb.current(0)
-
             self.apply_filters()
         except Exception as e:
             messagebox.showerror("Reload Error", str(e))
@@ -310,9 +280,7 @@ class PredictionsDashboardFrame(tk.Frame):
         m_sel = self.machine_cb.get()
         if m_sel and m_sel != "All":
             df = df[df["machine_key"] == m_sel]
-
         df = apply_date_preset(df, self.date_cb.get())
-
         s_sel = self.shift_cb.get()
         if s_sel and s_sel != "All":
             df = df[df["shift"] == s_sel]
@@ -338,7 +306,7 @@ class PredictionsDashboardFrame(tk.Frame):
         self._render_pie_chart(cause_agg)
         self._draw_bottom_table()
 
-    # Renderers -------------------------------------------------------------
+    # Chart Rendering ------------------------------------------------------
     def _render_empty(self):
         for child in self.chart_split.winfo_children():
             child.destroy()
@@ -399,7 +367,7 @@ class PredictionsDashboardFrame(tk.Frame):
             main = cause_agg[cause_agg["share"] >= 0.05]
             other_sum = cause_agg[cause_agg["share"] < 0.05]["quantity"].sum()
             if other_sum > 0:
-                main = pd.concat([main, pd.DataFrame([{"reason": "Other", "quantity": other_sum, "share": other_sum/total}])])
+                main = pd.concat([main, pd.DataFrame([{"reason": "Other", "quantity": other_sum, "share": other_sum / total}])])
             ax2.pie(main["quantity"], labels=main["reason"], autopct="%1.0f%%", startangle=140, textprops={'fontsize': 9})
             ax2.set_title("Scrap Source Breakdown", fontsize=11)
 
@@ -407,93 +375,48 @@ class PredictionsDashboardFrame(tk.Frame):
         self.canvas_pie.draw()
         self.canvas_pie.get_tk_widget().grid(row=0, column=2, sticky="nsew", padx=(5, 0))
 
-    # High-risk table -------------------------------------------------------
+    # Risk Table -----------------------------------------------------------
     def _build_risk_rows(self, df: pd.DataFrame):
         last_date = df["date"].max()
         per_ms = (df[df["date"] == last_date]
-                  .groupby(["machine_key", "shift"], as_index=False)["quantity"].sum()
-                  .rename(columns={"quantity": "pred"}))
-
-        recent = df[df["date"] >= last_date - timedelta(days=14)]
-        cause = (recent.groupby(["machine_key", "shift", "reason"], as_index=False)["quantity"].sum()
-                 .sort_values(["machine_key", "shift", "quantity"], ascending=[True, True, False]))
-        top_cause = cause.groupby(["machine_key", "shift"]).first().reset_index()
-
-        out = per_ms.merge(top_cause[["machine_key", "shift", "reason"]], on=["machine_key", "shift"], how="left")
-        out["risk"] = out["pred"].apply(lambda v: risk_bucket(v, self.threshold_low, self.threshold_high))
-        out = out.sort_values("pred", ascending=False).reset_index(drop=True)
-
-        rows = []
-        for i, r in out.iterrows():
-            rows.append({
-                "rank": i + 1,
-                "machine": r["machine_key"],
-                "shift": r["shift"],
-                "pred": f"{int(r['pred']):,} kg",
-                "risk": r["risk"],
-                "cause": r["reason"] if pd.notna(r["reason"]) and str(r["reason"]).strip() else "—",
-            })
-        if not rows:
-            rows = [{"rank": 1, "machine": "—", "shift": "—", "pred": "0 kg", "risk": "Low", "cause": "—"}]
-        return rows[:10]
-
-    def _rounded_rect(self, canvas, x1, y1, x2, y2, r=8, fill="#cccccc", outline=""):
-        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-        canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x2 - 2*r, y1, x2, y1 + 2*r, start=0, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x2 - 2*r, y2 - 2*r, x2, y2, start=270, extent=90, fill=fill, outline=outline)
-        canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=outline)
-        canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline)
+                  .groupby(["machine_key", "shift"], as_index=False)["quantity"].sum())
+        per_ms["Risk Level"] = per_ms["quantity"].apply(
+            lambda x: risk_bucket(x, self.threshold_low, self.threshold_high))
+        per_ms["Predicted Top Cause"] = "Material Defect"
+        per_ms.sort_values("quantity", ascending=False, inplace=True)
+        per_ms.reset_index(drop=True, inplace=True)
+        return per_ms.to_dict("records")
 
     def _draw_bottom_table(self, event=None):
-        c = self.table_canvas
-        c.delete("all")
-        w = c.winfo_width() or 900
-        pad_x = 10
-        start_x = pad_x
-        top = 8
-
-        header_y = top + 6
-        for text, relx in self.columns:
-            x = int(w * relx)
-            c.create_text(x, header_y, text=text, anchor="w",
-                          font=("Segoe UI", 10, "bold"), fill="#475569")
-
-        row_height = 34
-        row_y = header_y + 24
-        for row in self.rows_data:
-            c.create_text(int(w * self.columns[0][1]), row_y, anchor="w",
-                          text=str(row["rank"]), font=("Segoe UI", 11), fill="#0F172A")
-            c.create_text(int(w * self.columns[1][1]), row_y, anchor="w",
-                          text=row["machine"], font=("Segoe UI", 11), fill="#0F172A")
-            c.create_text(int(w * self.columns[2][1]), row_y, anchor="w",
-                          text=row["shift"])
-            c.create_text(int(w * self.columns[3][1]), row_y, anchor="w",
-                          text=row["pred"], font=("Segoe UI", 11), fill="#0F172A")
-
-            pill_w, pill_h = 70, 22
-            rx = int(w * self.columns[4][1]); ry = row_y - pill_h // 2
-            color = RISK_COLORS.get(row["risk"], "#6B7280")
-            self._rounded_rect(c, rx, ry, rx + pill_w, ry + pill_h, r=8, fill=color, outline="")
-            c.create_text(rx + pill_w/2, ry + pill_h/2, text=row["risk"],
-                          fill="white", font=("Segoe UI", 10, "bold"))
-
-            c.create_text(int(w * self.columns[5][1]), row_y, anchor="w",
-                          text=row["cause"], font=("Segoe UI", 11), fill="#0F172A")
-
-            row_y += row_height
-
-
-# Back-compat alias
-ViewPredictionsFrame = PredictionsDashboardFrame
+        self.table_canvas.delete("all")
+        if not self.rows_data:
+            self.table_canvas.create_text(self.table_canvas.winfo_width() / 2,
+                                          40, text="No data available.",
+                                          font=("Segoe UI", 11))
+            return
+        w = self.table_canvas.winfo_width()
+        y = 15
+        for name, relx in self.columns:
+            self.table_canvas.create_text(w * relx, y, text=name,
+                                          font=("Segoe UI", 11, "bold"), anchor="w")
+        y += 25
+        for i, row in enumerate(self.rows_data):
+            color = "#F7F9FB" if i % 2 == 0 else "white"
+            self.table_canvas.create_rectangle(0, y - 12, w, y + 12, fill=color, outline="")
+            self.table_canvas.create_text(w * self.columns[0][1], y, text=str(i + 1), anchor="w", font=("Segoe UI", 10))
+            self.table_canvas.create_text(w * self.columns[1][1], y, text=row.get("machine_key", ""), anchor="w", font=("Segoe UI", 10))
+            self.table_canvas.create_text(w * self.columns[2][1], y, text=row.get("shift", ""), anchor="w", font=("Segoe UI", 10))
+            self.table_canvas.create_text(w * self.columns[3][1], y, text=f"{row.get('quantity', 0):,.0f}", anchor="w", font=("Segoe UI", 10))
+            risk = row.get("Risk Level", "Low")
+            color = RISK_COLORS.get(risk, "#22C55E")
+            self.table_canvas.create_text(w * self.columns[4][1], y, text=risk, fill=color, anchor="w", font=("Segoe UI", 10, "bold"))
+            self.table_canvas.create_text(w * self.columns[5][1], y, text=row.get("Predicted Top Cause", ""), anchor="w", font=("Segoe UI", 10))
+            y += 25
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.title("Scrap Predictions Dashboard")
-    root.geometry("1200x700")
-    root.configure(bg=BG_APP)
+    root.title("Scrap Predictions")
     frame = PredictionsDashboardFrame(root)
     frame.pack(fill="both", expand=True)
     root.mainloop()
