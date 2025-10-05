@@ -1,499 +1,153 @@
-# view_predictions.py — cleaned for Neon/local Postgres + Tk
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import datetime, timedelta
-import numpy as np
-import pandas as pd
-import psycopg2
-import psycopg2.extras
-from psycopg2 import sql
-
-# Set backend for Tk BEFORE importing the TkAgg canvas adapter
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-# -----------------
-# SETTINGS / THEME
-# -----------------
-FILTER_BG = "#DCDAD5"
-RISK_COLORS = {"High": "#EF4444", "Medium": "#F59E0B", "Low": "#22C55E"}
-BG_SIDEBAR = "#DBE2E9"
-BG_APP = "white"
-
-# -----------------
-# DB (env-driven)
-# -----------------
-from db import get_db_connection
+from tkcalendar import Calendar
+from datetime import datetime
+from PIL import Image, ImageTk
+import sqlite3
 
 
-def fetch_logs() -> pd.DataFrame:
-    """
-    Pull scrap logs and normalize columns.
-    Expected base cols: date, quantity, unit, shift, reason, machine_name (or machine_operator).
-    """
-    with get_db_connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """SELECT column_name
-               FROM information_schema.columns
-               WHERE table_schema='public' AND table_name='scrap_logs';"""
-        )
-        cols = {r["column_name"] for r in cur.fetchall()}
-
-        sel_cols = ["date", "quantity", "unit", "shift", "reason"]
-        # prefer machine_name; fallback to machine_operator for the key
-        if "machine_name" in cols:
-            sel_cols.insert(0, "machine_name")
-        elif "machine_operator" in cols:
-            sel_cols.insert(0, "machine_operator")
-
-        if "comments" in cols:
-            sel_cols.append("comments")
-        if "entry_type" in cols:
-            sel_cols.append("entry_type")
-
-        qry = sql.SQL("SELECT {} FROM public.scrap_logs").format(
-            sql.SQL(", ").join(map(sql.Identifier, sel_cols))
-        )
-        cur.execute(qry)
-        rows = cur.fetchall()
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # normalize
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    df["unit"] = df["unit"].astype(str)
-
-    df["shift"] = (
-        df["shift"].astype(str).str.strip().str.upper().str.replace(r"^SHIFT\s+", "", regex=True)
-    )
-    df["reason"] = df.get("reason", pd.Series(index=df.index)).astype(str).str.strip()
-
-    if "machine_name" in df.columns:
-        df["machine_key"] = df["machine_name"].astype(str)
-    elif "machine_operator" in df.columns:
-        df["machine_key"] = df["machine_operator"].astype(str)
-    else:
-        df["machine_key"] = "Unknown"
-
-    df = df.dropna(subset=["date", "quantity", "unit", "shift", "machine_key"])
-    return df
-
-
-# -----------------
-# SMALL HELPERS
-# -----------------
-def apply_date_preset(df: pd.DataFrame, preset: str) -> pd.DataFrame:
-    if df.empty:
-        return df
-    today = datetime.today().date()
-    if preset == "Today":
-        return df[df["date"].dt.date == today]
-    if preset == "This Week":
-        monday = today - timedelta(days=datetime.today().weekday())
-        return df[df["date"].dt.date >= monday]
-    if preset == "This Month":
-        first = datetime(today.year, today.month, 1).date()
-        return df[df["date"].dt.date >= first]
-    if preset == "Last 30 Days":
-        return df[df["date"].dt.date >= today - timedelta(days=30)]
-    return df
-
-
-def fit_predict_with_ci(y: np.ndarray, periods_ahead: int = 7, ci=(10, 90)):
-    """
-    Simple baseline (linear trend + bootstrap residuals).
-    Always returns arrays so plots don't crash on tiny histories.
-    """
-    y = np.asarray(y, dtype=float)
-    y = y[~np.isnan(y) & ~np.isinf(y)]
-
-    if len(y) == 0:
-        empty = np.array([])
-        fut = np.zeros(periods_ahead)
-        return dict(y_pred=empty, lower=empty, upper=empty,
-                    future_pred=fut, future_lower=fut, future_upper=fut,
-                    resid=np.array([0.0]))
-
-    if len(y) == 1 or np.allclose(y, y[0]):
-        const = np.full(len(y), y.mean())
-        fut_const = np.full(periods_ahead, float(y.mean()))
-        return dict(y_pred=const, lower=const, upper=const,
-                    future_pred=fut_const, future_lower=fut_const, future_upper=fut_const,
-                    resid=np.array([0.0]))
-
-    n = len(y)
-    x = np.arange(n)
-    coef = np.polyfit(x, y, 1)
-    trend = np.poly1d(coef)(x)
-    resid = y - trend
-    if len(resid) < 5:
-        resid = np.pad(resid, (0, 5 - len(resid)), constant_values=resid.mean())
-
-    sims = 800
-    boot_in = np.random.choice(resid, size=(sims, n), replace=True)
-    sim_in = trend + boot_in
-    lower, upper = np.percentile(sim_in, ci[0], axis=0), np.percentile(sim_in, ci[1], axis=0)
-
-    xf = np.arange(n, n + periods_ahead)
-    future_trend = np.poly1d(coef)(xf)
-    boot_out = np.random.choice(resid, size=(sims, periods_ahead), replace=True)
-    sim_out = future_trend + boot_out
-    fl, fu = np.percentile(sim_out, ci[0], axis=0), np.percentile(sim_out, ci[1], axis=0)
-
-    return dict(y_pred=trend, lower=lower, upper=upper,
-                future_pred=future_trend, future_lower=fl, future_upper=fu,
-                resid=resid)
-
-
-def risk_bucket(value: float, threshold_low: float, threshold_high: float) -> str:
-    if value >= threshold_high:
-        return "High"
-    if value >= threshold_low:
-        return "Medium"
-    return "Low"
-
-
-# -----------------
-# FRAME
-# -----------------
-class PredictionsDashboardFrame(tk.Frame):
-    def __init__(self, parent, controller=None):
-        super().__init__(parent, bg=BG_APP)
+class AddScrapFrame(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent, bg="#F8FAFC")
         self.controller = controller
+        self.BASE_DIR = os.path.dirname(__file__)
+        self.IMAGE_DIR = os.path.join(self.BASE_DIR, "images")
+        self.DB_PATH = os.path.join(self.BASE_DIR, "sample_data.db")
 
-        # ---------- ttk Style ----------
-        style = ttk.Style(self)
+        self.scale_x = max(self.winfo_screenwidth() / 1920, 0.8)
+        self.scale_y = max(self.winfo_screenheight() / 1080, 0.8)
+        self.scale_font = (self.scale_x + self.scale_y) / 2
+
+        self.build_form()
+
+    # ---------- UI helpers ----------
+    def load_icon(self, name, size):
+        path = os.path.join(self.IMAGE_DIR, name)
+        if not os.path.exists(path):
+            return None
+        img = Image.open(path).convert("RGBA")
+        img = img.resize(size, Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+
+    def create_entry(self, parent, label, row, placeholder=""):
+        tk.Label(parent, text=label, bg="#F8FAFC", fg="#0F172A",
+                 font=("Segoe UI", 12, "bold")).grid(row=row, column=0, sticky="e", padx=10, pady=8)
+        e = tk.Entry(parent, font=("Segoe UI", 12), bg="white", relief="flat",
+                     highlightthickness=1, highlightbackground="#E5E7EB", highlightcolor="#3E84FB")
+        e.grid(row=row, column=1, padx=10, pady=8, ipadx=3, ipady=4)
+        if placeholder:
+            e.insert(0, placeholder)
+            e.config(fg="grey")
+            e.bind("<FocusIn>", lambda ev: self._clear_placeholder(e, placeholder))
+            e.bind("<FocusOut>", lambda ev: self._restore_placeholder(e, placeholder))
+        return e
+
+    def _clear_placeholder(self, e, text):
+        if e.get() == text:
+            e.delete(0, "end")
+            e.config(fg="black")
+
+    def _restore_placeholder(self, e, text):
+        if not e.get():
+            e.insert(0, text)
+            e.config(fg="grey")
+
+    # ---------- Build Form ----------
+    def build_form(self):
+        tk.Label(self, text="Add Scrap Entry",
+                 font=("Segoe UI", int(36 * self.scale_font), "bold"),
+                 bg="#F8FAFC", fg="#1F3B4D").pack(pady=(30, 20))
+
+        form = tk.Frame(self, bg="#F8FAFC")
+        form.pack(pady=10)
+
+        self.operator_entry = self.create_entry(form, "Machine Operator:", 0, "Enter operator name")
+        self.machine_entry = self.create_entry(form, "Machine Name:", 1, "Enter machine name")
+        self.date_entry = self.create_entry(form, "Date (MM/DD/YYYY):", 2, datetime.today().strftime("%m/%d/%Y"))
+
+        # Calendar picker
+        cal_icon = self.load_icon("schedule.png", (20, 20))
+        tk.Button(form, image=cal_icon if cal_icon else None, text=("📅" if not cal_icon else ""),
+                  command=self.open_calendar, bg="#F8FAFC", bd=0).grid(row=2, column=2, padx=5)
+        self.cal_icon = cal_icon
+
+        self.quantity_entry = self.create_entry(form, "Quantity:", 3, "e.g. 100")
+        self.unit_entry = self.create_entry(form, "Unit:", 4, "lbs")
+        self.total_entry = self.create_entry(form, "Total Produced:", 5, "e.g. 5000")
+
+        tk.Label(form, text="Shift:", bg="#F8FAFC", fg="#0F172A",
+                 font=("Segoe UI", 12, "bold")).grid(row=6, column=0, sticky="e", padx=10, pady=8)
+        self.shift_combo = ttk.Combobox(form, values=["A", "B", "C"],
+                                        font=("Segoe UI", 12), width=10, state="readonly")
+        self.shift_combo.set("A")
+        self.shift_combo.grid(row=6, column=1, padx=10, pady=8, sticky="w")
+
+        self.reason_entry = self.create_entry(form, "Reason:", 7, "Enter scrap cause")
+        self.comment_entry = self.create_entry(form, "Comments:", 8, "Optional comments")
+
+        tk.Button(self, text="Submit Entry", font=("Segoe UI", 14, "bold"),
+                  bg="#2563EB", fg="white", relief="flat", cursor="hand2",
+                  command=self.save_entry).pack(pady=25, ipadx=20, ipady=5)
+
+    def open_calendar(self):
+        top = tk.Toplevel(self)
+        top.title("Select Date")
+        cal = Calendar(top)
+        cal.pack(pady=10)
+        ttk.Button(top, text="Select", command=lambda: self._set_date(cal, top)).pack(pady=5)
+
+    def _set_date(self, cal, top):
+        date = cal.get_date()
+        self.date_entry.delete(0, "end")
+        self.date_entry.insert(0, date)
+        top.destroy()
+
+    # ---------- DB Logic ----------
+    def save_entry(self):
         try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+            operator = self.operator_entry.get().strip()
+            machine = self.machine_entry.get().strip()
+            date = self.date_entry.get().strip()
+            quantity = float(self.quantity_entry.get().strip())
+            unit = self.unit_entry.get().strip()
+            total = float(self.total_entry.get().strip() or 0)
+            shift = self.shift_combo.get()
+            reason = self.reason_entry.get().strip()
+            comments = self.comment_entry.get().strip()
 
-        style.configure("TButton", padding=6, relief="flat",
-                        background="#0078D7", foreground="white",
-                        font=("Segoe UI", 10, "bold"))
-        style.map("TButton", background=[("active", "#005A9E")])
+            if not operator or not machine or not date or quantity <= 0:
+                raise ValueError("Please fill out all required fields.")
 
-        style.configure("Custom.TCombobox",
-                        fieldbackground=FILTER_BG,
-                        background=FILTER_BG,
-                        selectbackground=FILTER_BG,
-                        selectforeground="black")
+            # Validate date
+            datetime.strptime(date, "%m/%d/%Y")
 
-        # ---------- Data ----------
-        self.df_raw = fetch_logs()
+            conn = sqlite3.connect(self.DB_PATH)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO scrap_logs
+                (machine_operator, machine_name, date, quantity, unit, total_produced, shift, reason, comments)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (operator, machine, date, quantity, unit, total, shift, reason, comments))
+            conn.commit()
+            conn.close()
 
-        # Defaults (tune as needed)
-        self.horizon_days = 7
-        self.threshold_low = 2500
-        self.threshold_high = 4000
+            messagebox.showinfo("Success", "Scrap entry added successfully!")
+            self._clear_form()
 
-        # ---------- Layout ----------
-        self.rowconfigure(1, weight=1)
-        self.columnconfigure(1, weight=1)
-
-        self._build_sidebar()
-        self._build_top_controls()
-        self._build_split_charts()
-        self._build_bottom_table()
-
-        self.apply_filters()
-
-    # Sidebar / Controls / Charts / Table builders unchanged ----------------
-    def _build_sidebar(self):
-        self.sidebar = tk.Frame(self, bg=BG_SIDEBAR, padx=10, pady=10)
-        self.sidebar.grid(row=0, column=0, rowspan=3, sticky="ns")
-        self.sidebar.columnconfigure(0, weight=1)
-
-        tk.Label(self.sidebar, text="Filters", font=("Segoe UI", 12, "bold"), bg=BG_SIDEBAR).pack(anchor="w", pady=(0, 10))
-
-        tk.Label(self.sidebar, text="Machine:", bg=BG_SIDEBAR).pack(anchor="w")
-        machines = ["All"]
-        if not self.df_raw.empty:
-            machines += sorted(self.df_raw["machine_key"].dropna().unique().tolist())
-        self.machine_cb = ttk.Combobox(self.sidebar, values=machines, state="readonly", style="Custom.TCombobox")
-        self.machine_cb.current(0)
-        self.machine_cb.pack(fill="x", pady=5)
-
-        tk.Label(self.sidebar, text="Date:", bg=BG_SIDEBAR).pack(anchor="w", pady=(10, 0))
-        self.date_cb = ttk.Combobox(self.sidebar, values=["Today", "This Week", "This Month", "Last 30 Days"],
-                                    state="readonly", style="Custom.TCombobox")
-        self.date_cb.current(3)
-        self.date_cb.pack(fill="x", pady=5)
-
-        tk.Label(self.sidebar, text="Shift:", bg=BG_SIDEBAR).pack(anchor="w", pady=(10, 0))
-        shifts = ["All"]
-        if not self.df_raw.empty:
-            shifts += sorted(self.df_raw["shift"].dropna().unique().tolist())
-        self.shift_cb = ttk.Combobox(self.sidebar, values=shifts, state="readonly", style="Custom.TCombobox")
-        self.shift_cb.current(0)
-        self.shift_cb.pack(fill="x", pady=5)
-
-        ttk.Button(self.sidebar, text="Apply Filters", command=self.apply_filters).pack(fill="x", pady=(20, 0))
-        ttk.Button(self.sidebar, text="Reload from DB", command=self._reload_from_db).pack(fill="x", pady=(8, 0))
-
-    def _build_top_controls(self):
-        self.top_controls = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
-        self.top_controls.grid(row=0, column=1, sticky="ew")
-        self.top_controls.columnconfigure(0, weight=1)
-
-        tk.Label(self.top_controls, text="Scrap Predictions", font=("Segoe UI", 14, "bold"), bg=BG_APP).pack(side="left")
-        ttk.Button(self.top_controls, text="Export Data", command=self._export_dummy).pack(side="right", padx=5)
-        ttk.Button(self.top_controls, text="Refresh", command=self.apply_filters).pack(side="right", padx=5)
-
-    def _build_split_charts(self):
-        self.chart_split = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
-        self.chart_split.grid(row=1, column=1, sticky="nsew")
-        self.chart_split.rowconfigure(0, weight=1)
-        self.chart_split.columnconfigure(0, weight=1)
-        self.chart_split.columnconfigure(2, weight=1)
-        self.canvas_line = None
-        self.canvas_pie = None
-
-    def _build_bottom_table(self):
-        self.bottom_frame = tk.Frame(self, bg=BG_APP, padx=10, pady=10)
-        self.bottom_frame.grid(row=2, column=1, sticky="nsew")
-        self.bottom_frame.rowconfigure(1, weight=1)
-        self.bottom_frame.columnconfigure(0, weight=1)
-
-        self.title_lbl = tk.Label(self.bottom_frame, text="High-Risk Forecast & Predicted Top Cause",
-                                  font=("Segoe UI", 16, "bold"), bg=BG_APP, fg="#0F172A")
-        self.title_lbl.grid(row=0, column=0, sticky="w", pady=(0, 6))
-
-        self.table_canvas = tk.Canvas(self.bottom_frame, bg=BG_APP, highlightthickness=0)
-        self.table_canvas.grid(row=1, column=0, sticky="nsew")
-        self.table_canvas.bind("<Configure>", self._draw_bottom_table)
-
-        self.columns = [
-            ("Rank", 0.03),
-            ("Machine", 0.16),
-            ("Shift", 0.31),
-            ("Predicted Scrap", 0.46),
-            ("Risk Level", 0.66),
-            ("Predicted Top Cause", 0.80),
-        ]
-        self.rows_data = []
-
-    # Actions ---------------------------------------------------------------
-    def _reload_from_db(self):
-        try:
-            self.df_raw = fetch_logs()
-            machines = ["All"] + (sorted(self.df_raw["machine_key"].unique().tolist()) if not self.df_raw.empty else [])
-            self.machine_cb["values"] = machines
-            self.machine_cb.current(0)
-
-            shifts = ["All"] + (sorted(self.df_raw["shift"].dropna().unique().tolist()) if not self.df_raw.empty else [])
-            self.shift_cb["values"] = shifts
-            self.shift_cb.current(0)
-
-            self.apply_filters()
+        except ValueError as ve:
+            messagebox.showerror("Input Error", str(ve))
         except Exception as e:
-            messagebox.showerror("Reload Error", str(e))
+            messagebox.showerror("Database Error", str(e))
 
-    def _export_dummy(self):
-        messagebox.showinfo("Export", "Hook your export logic here (CSV/XLSX).")
-
-    def apply_filters(self):
-        if self.df_raw.empty:
-            self._render_empty(); return
-
-        df = self.df_raw.copy()
-
-        m_sel = self.machine_cb.get()
-        if m_sel and m_sel != "All":
-            df = df[df["machine_key"] == m_sel]
-
-        df = apply_date_preset(df, self.date_cb.get())
-
-        s_sel = self.shift_cb.get()
-        if s_sel and s_sel != "All":
-            df = df[df["shift"] == s_sel]
-
-        if df.empty:
-            self._render_empty(); return
-
-        day = df.groupby("date", as_index=False)["quantity"].sum().sort_values("date")
-        y = day["quantity"].to_numpy(dtype=float)
-        model = fit_predict_with_ci(y, periods_ahead=self.horizon_days)
-        dates = day["date"].to_numpy()
-        fut_dates = pd.date_range(start=pd.to_datetime(dates[-1]) + timedelta(days=1),
-                                  periods=self.horizon_days, freq="D")
-
-        cause_df = df.assign(reason=df["reason"].replace({"": np.nan})).dropna(subset=["reason"])
-        cause_agg = (cause_df.groupby("reason", as_index=False)["quantity"].sum()
-                     .sort_values("quantity", ascending=False))
-
-        self.rows_data = self._build_risk_rows(df)
-
-        unit = df["unit"].mode().iat[0] if not df["unit"].empty else ""
-        self._render_line_chart(dates, y, model, fut_dates, unit=unit)
-        self._render_pie_chart(cause_agg)
-        self._draw_bottom_table()
-
-    # Renderers -------------------------------------------------------------
-    def _render_empty(self):
-        for child in self.chart_split.winfo_children():
-            child.destroy()
-        tk.Label(self.chart_split, text="No data for the selected filters.", bg=BG_APP,
-                 font=("Segoe UI", 12)).grid(row=0, column=0, sticky="nsew")
-        self.rows_data = []
-        self._draw_bottom_table()
-
-    def _render_line_chart(self, dates, y, model, fut_dates, unit=""):
-        for child in self.chart_split.grid_slaves(row=0, column=0):
-            child.destroy()
-
-        fig_line = Figure(figsize=(6, 3), dpi=100)
-        ax1 = fig_line.add_subplot(111)
-
-        if len(y) == 1:
-            ax1.scatter(dates, y, label="Actual", color="#0078D7")
-        else:
-            ax1.plot(dates, y, "o--", label="Actual", color="#0078D7", linewidth=1.2)
-
-        if len(model["y_pred"]) == len(dates) and len(model["y_pred"]):
-            ax1.plot(dates, model["y_pred"], "-", label="Predicted", color="#1F8EFA", linewidth=2)
-            if len(model["lower"]) == len(dates):
-                ax1.fill_between(dates, model["lower"], model["upper"], alpha=0.2, color="#1F8EFA", label="Confidence")
-
-        if len(fut_dates) and len(model["future_pred"]):
-            ax1.plot(fut_dates, model["future_pred"], ":", color="#1F8EFA", linewidth=2, label="Forecast")
-            if len(model["future_lower"]):
-                ax1.fill_between(fut_dates, model["future_lower"], model["future_upper"], alpha=0.15, color="#1F8EFA")
-
-        ax1.set_title(f"Predicted Scrap Volume ({unit})", fontsize=11)
-        ax1.set_xlabel("Date")
-        ax1.set_ylabel(f"Scrap ({unit})")
-        ax1.grid(True, linestyle="--", alpha=0.35)
-        ax1.legend()
-
-        self.canvas_line = FigureCanvasTkAgg(fig_line, master=self.chart_split)
-        self.canvas_line.draw()
-        self.canvas_line.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-
-        sep = tk.Frame(self.chart_split, bg="#B0B0B0", width=2)
-        sep.grid(row=0, column=1, sticky="ns", padx=2)
-
-    def _render_pie_chart(self, cause_agg: pd.DataFrame):
-        for child in self.chart_split.grid_slaves(row=0, column=2):
-            child.destroy()
-
-        fig_pie = Figure(figsize=(5, 3), dpi=100)
-        ax2 = fig_pie.add_subplot(111)
-
-        if cause_agg.empty:
-            ax2.axis("off")
-            ax2.text(0.5, 0.5, "No scrap causes available\nin the selected window.",
-                     ha="center", va="center", fontsize=11)
-        else:
-            total = cause_agg["quantity"].sum()
-            cause_agg["share"] = cause_agg["quantity"] / total
-            main = cause_agg[cause_agg["share"] >= 0.05]
-            other_sum = cause_agg[cause_agg["share"] < 0.05]["quantity"].sum()
-            if other_sum > 0:
-                main = pd.concat([main, pd.DataFrame([{"reason": "Other", "quantity": other_sum, "share": other_sum/total}])])
-            ax2.pie(main["quantity"], labels=main["reason"], autopct="%1.0f%%", startangle=140, textprops={'fontsize': 9})
-            ax2.set_title("Scrap Source Breakdown", fontsize=11)
-
-        self.canvas_pie = FigureCanvasTkAgg(fig_pie, master=self.chart_split)
-        self.canvas_pie.draw()
-        self.canvas_pie.get_tk_widget().grid(row=0, column=2, sticky="nsew", padx=(5, 0))
-
-    # High-risk table -------------------------------------------------------
-    def _build_risk_rows(self, df: pd.DataFrame):
-        last_date = df["date"].max()
-        per_ms = (df[df["date"] == last_date]
-                  .groupby(["machine_key", "shift"], as_index=False)["quantity"].sum()
-                  .rename(columns={"quantity": "pred"}))
-
-        recent = df[df["date"] >= last_date - timedelta(days=14)]
-        cause = (recent.groupby(["machine_key", "shift", "reason"], as_index=False)["quantity"].sum()
-                 .sort_values(["machine_key", "shift", "quantity"], ascending=[True, True, False]))
-        top_cause = cause.groupby(["machine_key", "shift"]).first().reset_index()
-
-        out = per_ms.merge(top_cause[["machine_key", "shift", "reason"]], on=["machine_key", "shift"], how="left")
-        out["risk"] = out["pred"].apply(lambda v: risk_bucket(v, self.threshold_low, self.threshold_high))
-        out = out.sort_values("pred", ascending=False).reset_index(drop=True)
-
-        rows = []
-        for i, r in out.iterrows():
-            rows.append({
-                "rank": i + 1,
-                "machine": r["machine_key"],
-                "shift": r["shift"],
-                "pred": f"{int(r['pred']):,} kg",
-                "risk": r["risk"],
-                "cause": r["reason"] if pd.notna(r["reason"]) and str(r["reason"]).strip() else "—",
-            })
-        if not rows:
-            rows = [{"rank": 1, "machine": "—", "shift": "—", "pred": "0 kg", "risk": "Low", "cause": "—"}]
-        return rows[:10]
-
-    def _rounded_rect(self, canvas, x1, y1, x2, y2, r=8, fill="#cccccc", outline=""):
-        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-        canvas.create_arc(x1, y1, x1 + 2*r, y1 + 2*r, start=90, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x2 - 2*r, y1, x2, y1 + 2*r, start=0, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x1, y2 - 2*r, x1 + 2*r, y2, start=180, extent=90, fill=fill, outline=outline)
-        canvas.create_arc(x2 - 2*r, y2 - 2*r, x2, y2, start=270, extent=90, fill=fill, outline=outline)
-        canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=outline)
-        canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline)
-
-    def _draw_bottom_table(self, event=None):
-        c = self.table_canvas
-        c.delete("all")
-        w = c.winfo_width() or 900
-        pad_x = 10
-        start_x = pad_x
-        top = 8
-
-        header_y = top + 6
-        for text, relx in self.columns:
-            x = int(w * relx)
-            c.create_text(x, header_y, text=text, anchor="w",
-                          font=("Segoe UI", 10, "bold"), fill="#475569")
-
-        row_height = 34
-        row_y = header_y + 24
-        for row in self.rows_data:
-            c.create_text(int(w * self.columns[0][1]), row_y, anchor="w",
-                          text=str(row["rank"]), font=("Segoe UI", 11), fill="#0F172A")
-            c.create_text(int(w * self.columns[1][1]), row_y, anchor="w",
-                          text=row["machine"], font=("Segoe UI", 11), fill="#0F172A")
-            c.create_text(int(w * self.columns[2][1]), row_y, anchor="w",
-                          text=row["shift"])
-            c.create_text(int(w * self.columns[3][1]), row_y, anchor="w",
-                          text=row["pred"], font=("Segoe UI", 11), fill="#0F172A")
-
-            pill_w, pill_h = 70, 22
-            rx = int(w * self.columns[4][1]); ry = row_y - pill_h // 2
-            color = RISK_COLORS.get(row["risk"], "#6B7280")
-            self._rounded_rect(c, rx, ry, rx + pill_w, ry + pill_h, r=8, fill=color, outline="")
-            c.create_text(rx + pill_w/2, ry + pill_h/2, text=row["risk"],
-                          fill="white", font=("Segoe UI", 10, "bold"))
-
-            c.create_text(int(w * self.columns[5][1]), row_y, anchor="w",
-                          text=row["cause"], font=("Segoe UI", 11), fill="#0F172A")
-
-            row_y += row_height
-
-
-# Back-compat alias
-ViewPredictionsFrame = PredictionsDashboardFrame
-
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.title("Scrap Predictions Dashboard")
-    root.geometry("1200x700")
-    root.configure(bg=BG_APP)
-    frame = PredictionsDashboardFrame(root)
-    frame.pack(fill="both", expand=True)
-    root.mainloop()
+    def _clear_form(self):
+        self.operator_entry.delete(0, "end")
+        self.machine_entry.delete(0, "end")
+        self.date_entry.delete(0, "end")
+        self.date_entry.insert(0, datetime.today().strftime("%m/%d/%Y"))
+        self.quantity_entry.delete(0, "end")
+        self.unit_entry.delete(0, "end")
+        self.total_entry.delete(0, "end")
+        self.reason_entry.delete(0, "end")
+        self.comment_entry.delete(0, "end")
+        self.shift_combo.set("A")
